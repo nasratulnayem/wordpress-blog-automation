@@ -9,18 +9,29 @@ from html import unescape
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
-import google.generativeai as genai
 import requests
 from dotenv import load_dotenv
 from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
 
 load_dotenv()
 
+try:
+    from google import genai as genai_sdk
+except Exception:  # noqa: BLE001
+    genai_sdk = None
+
+try:
+    import google.generativeai as genai_legacy
+except Exception:  # noqa: BLE001
+    genai_legacy = None
+
 ENV_WP_BASE_URL = os.getenv("WP_BASE_URL", "").rstrip("/")
 ENV_WP_USERNAME = os.getenv("WP_USERNAME", "")
 ENV_WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
 ENV_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+ENV_GEMINI_API_KEYS = os.getenv("GEMINI_API_KEYS", "").strip()
 ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
+ENV_GEMINI_SDK = os.getenv("GEMINI_SDK", "auto").strip().lower()
 ENV_CUSTOM_PROMPT = os.getenv("CUSTOM_PROMPT", "").strip()
 
 ENV_META_TITLE_KEY = os.getenv("META_TITLE_KEY", "yoast_wpseo_title")
@@ -47,10 +58,26 @@ INBOUND_LINKS = [
 ]
 
 DEFAULT_CUSTOM_PROMPT = """
-About GPLMama (site context):
-GPLMama is Bangladesh's affordable hub for premium digital assets. We offer lifetime access to 2,200+ assets for a one-time fee of BDT 149 and give 5 free downloads to new users. The library includes popular WordPress themes, plugins, WooCommerce plugins, and Shopify themes. Files are original and unmodified. New files are added regularly. The GPL model is legal and safe. We support freelancers, small businesses, and agencies. There is a commercial license for client work and resale. Local support and video guides are available.
+Required GPLMama context (use when relevant, stay factual, no overselling):
+GPLMama is Bangladesh's affordable hub for premium digital assets. We offer lifetime access to 2,200+ assets for a one-time fee of BDT 149 with no ads or hassles. The library includes WordPress themes, plugins, WooCommerce plugins, and Shopify themes. Files are original and unmodified. New files are added regularly. The GPL model is legal and safe. We support freelancers, small businesses, and agencies. There is a commercial license for client work and resale. Local support and video guides are available.
 
-When relevant, weave this context into the post naturally and professionally. Do not oversell. Keep claims factual and grounded.
+Writing rules (apply throughout):
+- Write about 2000 words.
+- Use simple, plain language and short sentences.
+- Avoid AI-sounding phrases and cliches (no "let's dive in", "game-changing", "unlock potential").
+- Be direct and concise. Remove filler words.
+- Keep the tone natural and conversational. It is ok to start sentences with "and" or "but".
+- Avoid hype, buzzwords, and overpromises.
+- Keep grammar simple and readable.
+- Remove fluff and extra adjectives.
+- Make every sentence clear and easy to understand.
+- Use transitions for flow and break long paragraphs into smaller ones.
+- Keep the tone friendly, helpful, and real (not robotic or academic).
+
+Uniqueness and expertise:
+- Derive 10 key questions a writer would ask to make this unique.
+- Answer those questions inside the post without listing them.
+- Include practical examples, light storytelling, or mini case scenarios where useful.
 """.strip()
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
@@ -238,20 +265,143 @@ def safe_next_url(next_url: str, fallback: str) -> str:
 
 
 class GeminiClient:
-    def __init__(self, api_key: str, model_name: str) -> None:
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model_name)
+    def __init__(self, api_key: str, model_name: str, sdk_mode: str = "auto") -> None:
+        self.api_key = api_key
+        self.model_name = model_name
+        self.sdk_mode = (sdk_mode or "auto").strip().lower()
+        self.client = None
+        self.model = None
+        self.active_sdk = ""
+
+        prefer_new = self.sdk_mode in ("auto", "genai")
+        prefer_legacy = self.sdk_mode in ("auto", "legacy")
+
+        if prefer_new and genai_sdk is not None:
+            self.client = genai_sdk.Client(api_key=api_key)
+            self.active_sdk = "genai"
+        elif prefer_legacy and genai_legacy is not None:
+            genai_legacy.configure(api_key=api_key)
+            self.model = genai_legacy.GenerativeModel(model_name)
+            self.active_sdk = "legacy"
+        else:
+            if self.sdk_mode == "genai":
+                raise RuntimeError("GEMINI_SDK=genai but google-genai is not installed.")
+            if self.sdk_mode == "legacy":
+                raise RuntimeError(
+                    "GEMINI_SDK=legacy but google-generativeai is not installed."
+                )
+            raise RuntimeError(
+                "No Gemini SDK available. Install google-genai or google-generativeai."
+            )
 
     def generate(self, prompt: str) -> str:
+        if self.active_sdk == "genai":
+            response = self.client.models.generate_content(
+                model=self.model_name, contents=prompt
+            )
+            return self._extract_text(response)
         response = self.model.generate_content(prompt)
         return response.text or ""
 
+    def _extract_text(self, response: Any) -> str:
+        text = getattr(response, "text", None)
+        if text:
+            return text
+        candidates = getattr(response, "candidates", None)
+        if candidates:
+            content = getattr(candidates[0], "content", None)
+            parts = getattr(content, "parts", None) if content else None
+            if parts:
+                return getattr(parts[0], "text", "") or ""
+        return ""
+
     def list_models(self) -> List[str]:
         models = []
-        for model in genai.list_models():
+        if self.active_sdk == "genai":
+            try:
+                for model in self.client.models.list():
+                    name = getattr(model, "name", "")
+                    if name:
+                        models.append(name)
+            except Exception:  # noqa: BLE001
+                return []
+            return models
+        for model in genai_legacy.list_models():
             if "generateContent" in model.supported_generation_methods:
                 models.append(model.name)
         return models
+
+
+def is_quota_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "resourceexhausted" in message or "quota" in message or "429" in message
+
+
+class MultiKeyGemini:
+    def __init__(self, runtime: Dict[str, Any]) -> None:
+        self.runtime = runtime
+        keys = runtime.get("gemini_api_keys") or []
+        if not keys and runtime.get("gemini_api_key"):
+            keys = [runtime.get("gemini_api_key", "")]
+        self.keys = [key for key in keys if key.strip()]
+
+    def _make_client(self, api_key: str) -> GeminiClient:
+        return GeminiClient(
+            api_key,
+            self.runtime.get("gemini_model", "gemini-1.5-flash"),
+            self.runtime.get("gemini_sdk", "auto"),
+        )
+
+    def generate(self, prompt: str, conn: Optional[sqlite3.Connection] = None) -> str:
+        if not self.keys:
+            raise RuntimeError("Gemini API key is missing.")
+        last_exc: Optional[Exception] = None
+        for api_key in self.keys:
+            gemini = self._make_client(api_key)
+            try:
+                return gemini.generate(prompt)
+            except Exception as exc:  # noqa: BLE001
+                if "models/" in str(exc) and "not found" in str(exc):
+                    models = gemini.list_models()
+                    picked = choose_default_model(models)
+                    if picked:
+                        self.runtime["gemini_model"] = picked
+                        if conn is not None:
+                            conn.execute(
+                                """
+                                INSERT INTO app_config (key, value)
+                                VALUES (?, ?)
+                                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                                """,
+                                ("gemini_model", picked),
+                            )
+                        gemini = self._make_client(api_key)
+                        return gemini.generate(prompt)
+                    raise
+                if is_quota_error(exc):
+                    last_exc = exc
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Gemini API key is missing.")
+
+    def list_models(self) -> List[str]:
+        if not self.keys:
+            return []
+        last_exc: Optional[Exception] = None
+        for api_key in self.keys:
+            gemini = self._make_client(api_key)
+            try:
+                return gemini.list_models()
+            except Exception as exc:  # noqa: BLE001
+                if is_quota_error(exc):
+                    last_exc = exc
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        return []
 
 
 def choose_default_model(models: List[str]) -> str:
@@ -295,11 +445,12 @@ def pick_inbound_links() -> List[str]:
 
 def build_prompt(title: str, inbound_links: List[str], custom_prompt: str) -> str:
     inbound_text = "\n".join(f"- {link}" for link in inbound_links)
+    required_prompt = DEFAULT_CUSTOM_PROMPT.replace("{title}", title)
     custom_text = ""
     if custom_prompt:
-        custom_text = (
-            f"\nAdditional instructions:\n{custom_prompt.replace('{title}', title)}\n"
-        )
+        cleaned_custom = custom_prompt.replace("{title}", title).strip()
+        if cleaned_custom and cleaned_custom != required_prompt:
+            custom_text = f"\nAdditional instructions:\n{cleaned_custom}\n"
 
     return f"""
 You are writing a professional blog post.
@@ -307,13 +458,12 @@ You are writing a professional blog post.
 Topic: {title}
 
 Rules:
-- 1900 to 2200 words.
+- About 2000 words.
 - Use plain language and short sentences.
 - No hype, no buzzwords, no clichés.
 - No special characters or emojis.
 - Do not use headings like Conclusion or Final thoughts.
 - Start with a short intro paragraph, not a title heading.
-- Do not include any H1 heading.
 - Keep tone natural, helpful, and human.
 - Stay on topic and do not add unrelated content.
 - Use clear H2 and H3 structure.
@@ -344,6 +494,8 @@ Return only valid JSON with these keys:
 - meta_title
 - meta_description
 - tags (array of strings)
+Required site and writing requirements:
+{required_prompt}
 {custom_text}
 """.strip()
 
@@ -494,44 +646,29 @@ def perform_generation(post_id: int, runtime: Dict[str, Any]) -> None:
     client = WordPressClient(
         runtime["wp_base_url"], runtime["wp_username"], runtime["wp_app_password"]
     )
-    gemini = GeminiClient(runtime["gemini_api_key"], runtime["gemini_model"])
+    gemini = MultiKeyGemini(runtime)
     conn = get_db()
 
     post = client.get_post(post_id)
     title = normalize_title(post.get("title", {}).get("rendered", ""))
+    current_html = post.get("content", {}).get("rendered", "")
+    if not is_empty_content(current_html):
+        with conn:
+            update_status(conn, post_id, "done", "Skipped: content already exists.")
+        conn.close()
+        return
     if is_canceled(post_id):
         return
 
     inbound_links = runtime["inbound_links"] or INBOUND_LINKS
     inbound_links = random.sample(inbound_links, min(2, len(inbound_links)))
     prompt = build_prompt(title, inbound_links, runtime["custom_prompt"])
-    try:
-        response_text = gemini.generate(prompt)
-    except Exception as exc:  # noqa: BLE001
-        if "models/" in str(exc) and "not found" in str(exc):
-            models = gemini.list_models()
-            picked = choose_default_model(models)
-            if picked:
-                runtime["gemini_model"] = picked
-                conn.execute(
-                    """
-                    INSERT INTO app_config (key, value)
-                    VALUES (?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                    """,
-                    ("gemini_model", picked),
-                )
-                gemini = GeminiClient(runtime["gemini_api_key"], picked)
-                response_text = gemini.generate(prompt)
-            else:
-                raise
-        else:
-            raise
+    response_text = gemini.generate(prompt, conn)
     try:
         data = extract_json(response_text)
     except Exception:
         repair_prompt = build_json_repair_prompt(prompt, response_text)
-        response_text = gemini.generate(repair_prompt)
+        response_text = gemini.generate(repair_prompt, conn)
         data = extract_json(response_text)
 
     content_html = data.get("content_html", "").strip()
@@ -544,12 +681,12 @@ def perform_generation(post_id: int, runtime: Dict[str, Any]) -> None:
 
     if not meta_title or not meta_description or not tags:
         metadata_prompt = build_metadata_prompt(title, content_html)
-        metadata_response = gemini.generate(metadata_prompt)
+        metadata_response = gemini.generate(metadata_prompt, conn)
         try:
             metadata = extract_json(metadata_response)
         except Exception:
             repair_prompt = build_json_repair_prompt(metadata_prompt, metadata_response)
-            metadata_response = gemini.generate(repair_prompt)
+            metadata_response = gemini.generate(repair_prompt, conn)
             metadata = extract_json(metadata_response)
         meta_title = metadata.get("meta_title", "").strip() or meta_title
         meta_description = (
@@ -606,8 +743,12 @@ def get_config(conn: sqlite3.Connection) -> Dict[str, str]:
         config["wp_app_password"] = ENV_WP_APP_PASSWORD
     if "gemini_api_key" not in config:
         config["gemini_api_key"] = ENV_GEMINI_API_KEY
+    if "gemini_api_keys" not in config and ENV_GEMINI_API_KEYS:
+        config["gemini_api_keys"] = ENV_GEMINI_API_KEYS
     if "gemini_model" not in config:
         config["gemini_model"] = ENV_GEMINI_MODEL
+    if "gemini_sdk" not in config:
+        config["gemini_sdk"] = ENV_GEMINI_SDK
     if "custom_prompt" not in config or not config["custom_prompt"].strip():
         config["custom_prompt"] = ENV_CUSTOM_PROMPT or DEFAULT_CUSTOM_PROMPT
     if "meta_title_key" not in config:
@@ -646,16 +787,28 @@ def parse_links(raw: str) -> List[str]:
     return [line for line in lines if line]
 
 
+def parse_api_keys(raw: str) -> List[str]:
+    if not raw:
+        return []
+    parts = re.split(r"[,\n]", raw)
+    return [part.strip() for part in parts if part.strip()]
+
+
 def get_runtime_config() -> Dict[str, Any]:
     conn = get_db()
     config = get_config(conn)
     conn.close()
+    gemini_api_keys = parse_api_keys(config.get("gemini_api_keys", ""))
+    if not gemini_api_keys and config.get("gemini_api_key"):
+        gemini_api_keys = [config.get("gemini_api_key", "").strip()]
     return {
         "wp_base_url": config.get("wp_base_url", "").rstrip("/"),
         "wp_username": config.get("wp_username", ""),
         "wp_app_password": config.get("wp_app_password", ""),
         "gemini_api_key": config.get("gemini_api_key", ""),
+        "gemini_api_keys": gemini_api_keys,
         "gemini_model": config.get("gemini_model", "gemini-1.5-flash"),
+        "gemini_sdk": config.get("gemini_sdk", "auto"),
         "custom_prompt": config.get("custom_prompt", "").strip(),
         "meta_title_key": config.get("meta_title_key", ""),
         "meta_description_key": config.get("meta_description_key", ""),
@@ -733,12 +886,12 @@ def build_index_context(
     conn = get_db()
     config = get_config(conn)
     has_wp_password = bool(config.get("wp_app_password"))
-    has_gemini_key = bool(config.get("gemini_api_key"))
+    has_gemini_key = bool(config.get("gemini_api_key") or config.get("gemini_api_keys"))
     if not (
         runtime["wp_base_url"]
         and runtime["wp_username"]
         and runtime["wp_app_password"]
-        and runtime["gemini_api_key"]
+        and (runtime["gemini_api_key"] or runtime.get("gemini_api_keys"))
     ):
         posts = []
         conn.close()
@@ -900,7 +1053,7 @@ def generate(post_id: int) -> str:
         runtime["wp_base_url"]
         and runtime["wp_username"]
         and runtime["wp_app_password"]
-        and runtime["gemini_api_key"]
+        and (runtime["gemini_api_key"] or runtime.get("gemini_api_keys"))
     ):
         flash("Missing configuration. Open Settings to finish setup.")
         return redirect_back()
@@ -1002,7 +1155,7 @@ def settings() -> str:
     conn = get_db()
     config = get_config(conn)
     has_wp_password = bool(config.get("wp_app_password"))
-    has_gemini_key = bool(config.get("gemini_api_key"))
+    has_gemini_key = bool(config.get("gemini_api_key") or config.get("gemini_api_keys"))
     next_url = request.values.get("next", "")
 
     if request.method == "POST":
@@ -1055,12 +1208,12 @@ def settings() -> str:
 @app.route("/fetch-models", methods=["POST"])
 def fetch_models() -> str:
     runtime = get_runtime_config()
-    if not runtime["gemini_api_key"]:
+    if not (runtime["gemini_api_key"] or runtime.get("gemini_api_keys")):
         flash("Gemini API key is missing.")
         return redirect_back("settings")
 
     try:
-        gemini = GeminiClient(runtime["gemini_api_key"], runtime["gemini_model"])
+        gemini = MultiKeyGemini(runtime)
         models = gemini.list_models()
     except Exception as exc:  # noqa: BLE001
         flash(f"Model fetch failed: {exc}")
@@ -1102,9 +1255,9 @@ def test_connection() -> str:
         except Exception as exc:  # noqa: BLE001
             wp_error = str(exc)
 
-    if runtime["gemini_api_key"]:
+    if runtime["gemini_api_key"] or runtime.get("gemini_api_keys"):
         try:
-            gemini = GeminiClient(runtime["gemini_api_key"], runtime["gemini_model"])
+            gemini = MultiKeyGemini(runtime)
             gemini.generate("Return the word OK only.")
             gemini_ok = True
         except Exception as exc:  # noqa: BLE001
