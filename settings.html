@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% set title = "Settings" %}
+{% block content %}
+  <div class="card">
+    <h2>Settings</h2>
+    <form method="post" action="{{ url_for('settings') }}">
+      {% if next_url %}
+        <input type="hidden" name="next" value="{{ next_url }}">
+      {% endif %}
+      <div class="grid">
+        <div>
+          <label for="wp_base_url">WordPress Base URL</label>
+          <input id="wp_base_url" type="text" name="wp_base_url" value="{{ config.get('wp_base_url', '') }}">
+        </div>
+        <div>
+          <label for="wp_username">WordPress Username</label>
+          <input id="wp_username" type="text" name="wp_username" value="{{ config.get('wp_username', '') }}">
+        </div>
+        <div>
+          <label for="wp_app_password">WordPress App Password</label>
+          <input id="wp_app_password" type="password" name="wp_app_password" value="" placeholder="{% if has_wp_password %}Saved{% else %}Enter app password{% endif %}">
+        </div>
+        <div>
+          <label for="gemini_api_key">Gemini API Key</label>
+          <input id="gemini_api_key" type="password" name="gemini_api_key" value="" placeholder="{% if has_gemini_key %}Saved{% else %}Enter API key{% endif %}">
+        </div>
+        <div>
+          <label for="gemini_model">Gemini Model</label>
+          <input id="gemini_model" type="text" name="gemini_model" list="model-list" value="{{ config.get('gemini_model', '') }}">
+          {% set models = config.get('available_models', '').splitlines() %}
+          <datalist id="model-list">
+            {% for model in models %}
+              <option value="{{ model }}"></option>
+            {% endfor %}
+          </datalist>
+        </div>
+        <div>
+          <label for="meta_title_key">Meta Title Key</label>
+          <input id="meta_title_key" type="text" name="meta_title_key" value="{{ config.get('meta_title_key', '') }}">
+        </div>
+        <div>
+          <label for="meta_description_key">Meta Description Key</label>
+          <input id="meta_description_key" type="text" name="meta_description_key" value="{{ config.get('meta_description_key', '') }}">
+        </div>
+        <div>
+          <label for="posts_per_page">Posts Per Page</label>
+          <input id="posts_per_page" type="text" name="posts_per_page" value="{{ config.get('posts_per_page', '') }}">
+        </div>
+        <div>
+          <label for="max_pages">Max Pages</label>
+          <input id="max_pages" type="text" name="max_pages" value="{{ config.get('max_pages', '') }}">
+        </div>
+      </div>
+
+      <div style="margin-top:16px;">
+        <label>
+          <input type="checkbox" name="use_excerpt" {% if config.get('use_excerpt_for_meta_description', 'true') in ['1','true','yes'] %}checked{% endif %}>
+          Use excerpt for meta description when available
+        </label>
+      </div>
+
+      <div style="margin-top:16px;">
+        <label for="custom_prompt">Custom Prompt</label>
+        <textarea id="custom_prompt" name="custom_prompt">{{ config.get('custom_prompt', '') }}</textarea>
+        <div class="small muted">You can use {title} in the prompt.</div>
+      </div>
+
+      <div style="margin-top:16px;">
+        <label for="inbound_links">Inbound Links (one per line)</label>
+        <textarea id="inbound_links" name="inbound_links">{{ config.get('inbound_links', '') }}</textarea>
+      </div>
+
+      <div style="margin-top:16px;">
+        <button class="button" type="submit">Save Settings</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Actions</h3>
+    <div style="display:flex; gap:10px; flex-wrap:wrap;">
+      <form method="post" action="{{ url_for('test_connection') }}">
+        <button class="button secondary" type="submit">Test Connection</button>
+      </form>
+      <form method="post" action="{{ url_for('fetch_models') }}">
+        <button class="button secondary" type="submit">Fetch Models</button>
+      </form>
+    </div>
+  </div>
+{% endblock %}
