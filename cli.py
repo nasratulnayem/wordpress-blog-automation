@@ -10,6 +10,7 @@ from app import (
     get_db,
     get_runtime_config,
     get_status_map,
+    init_db,
     is_empty_content,
     normalize_title,
     perform_generation,
@@ -67,12 +68,13 @@ def should_skip_done(status_map: Dict[int, Any], post_id: int) -> bool:
 
 
 def main() -> int:
+    init_db()
     runtime = get_runtime_config()
     if not (
         runtime["wp_base_url"]
         and runtime["wp_username"]
         and runtime["wp_app_password"]
-        and runtime["gemini_api_key"]
+        and (runtime["gemini_api_key"] or runtime.get("gemini_api_keys"))
     ):
         print("Missing configuration. Set WordPress and Gemini credentials.")
         return 1
