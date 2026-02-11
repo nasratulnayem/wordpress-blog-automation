@@ -533,6 +533,30 @@ def is_quota_error(exc: Exception) -> bool:
     return "resourceexhausted" in message or "quota" in message or "429" in message
 
 
+def compact_error_message(raw: Optional[str]) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if "api_key_invalid" in lowered or "api key not valid" in lowered:
+        return "Invalid API Key"
+    if "resource_exhausted" in lowered or "resourceexhausted" in lowered:
+        return "Quota Limit"
+    if "quota" in lowered or "429" in lowered:
+        return "Quota Limit"
+    if "missing product seo meta keys" in lowered:
+        return "SEO Keys Missing"
+    if "could not generate product slug" in lowered:
+        return "Slug Failed"
+    if "generated title did not match rules" in lowered:
+        return "Title Rule Error"
+    if "generated seo meta did not match length/rules" in lowered:
+        return "SEO Rule Error"
+    if "json" in lowered and "invalid" in lowered:
+        return "Invalid AI Output"
+    return "Process Error"
+
+
 class MultiKeyGemini:
     def __init__(self, runtime: Dict[str, Any]) -> None:
         self.runtime = runtime
@@ -805,7 +829,7 @@ def update_product_status(
             product_id,
             status,
             datetime.now(timezone.utc).isoformat(),
-            error,
+            compact_error_message(error),
             old_title,
             new_title,
             permalink,
@@ -847,16 +871,16 @@ def update_product_piece_flags(
         params.append(int(slug_done))
     if last_title_error is not None:
         fields.append("last_title_error = ?")
-        params.append(last_title_error)
+        params.append(compact_error_message(last_title_error))
     if last_desc_error is not None:
         fields.append("last_desc_error = ?")
-        params.append(last_desc_error)
+        params.append(compact_error_message(last_desc_error))
     if last_seo_error is not None:
         fields.append("last_seo_error = ?")
-        params.append(last_seo_error)
+        params.append(compact_error_message(last_seo_error))
     if last_slug_error is not None:
         fields.append("last_slug_error = ?")
-        params.append(last_slug_error)
+        params.append(compact_error_message(last_slug_error))
     if seo_title is not None:
         fields.append("seo_title = ?")
         params.append(seo_title)
@@ -1653,6 +1677,27 @@ def wc_meta_has(product: Dict[str, Any], key: str) -> bool:
     return False
 
 
+def is_store_related_product_title(title: str) -> bool:
+    text = (title or "").lower()
+    store_terms = (
+        "woocommerce",
+        "shop",
+        "store",
+        "cart",
+        "checkout",
+        "catalog",
+        "product filter",
+        "product search",
+        "payment",
+        "stripe",
+        "paypal",
+        "inventory",
+        "pos",
+        "affiliate",
+    )
+    return any(term in text for term in store_terms)
+
+
 def ensure_wc_product_meta(
     wc_client: WooCommerceClient,
     wp_client: WordPressClient,
@@ -1686,10 +1731,15 @@ def ensure_wc_product_meta(
     return True, ""
 
 
-def build_product_title_prompt(original_title: str) -> str:
+def build_product_title_prompt(original_title: str, store_related: bool) -> str:
     original_title = clamp_spaces(original_title)
+    commerce_rule = (
+        '- Only mention "WooCommerce" if the product is clearly store/ecommerce related.'
+        if store_related
+        else '- Do not mention "WooCommerce" in the title for this product.'
+    )
     return f"""
-Rewrite this WooCommerce product title for SEO.
+Rewrite this product title for SEO.
 
 Original title: {original_title}
 
@@ -1700,10 +1750,12 @@ Rules:
 - Remove the word "free" / "Free" (and any similar "free ..." wording).
 - Do not use the word "official".
 - Do not use "WooCommerce Pro" (WooCommerce does not have a Pro product).
+- {commerce_rule}
 - If you mention WooCommerce, spell it exactly "WooCommerce" (not "woocomerce").
 - Use simple words WordPress developers search on Google.
 - You may use: premium, pro, download.
 - Keep it natural, professional, not hype.
+- Be creative: vary structure and avoid repeating common starter patterns.
 - Do not add quotes or emojis.
 """.strip()
 
@@ -1742,12 +1794,13 @@ def strip_membership_mentions(html: str) -> str:
 
 def ensure_description_heading(html: str, title: str) -> str:
     title = clamp_spaces(title)
+    heading = build_description_heading(title)
     if not html:
-        return f"<h2>Why you need {title}?</h2>"
+        return f"<h2>{heading}</h2>"
     trimmed = html.lstrip()
     if re.match(r"^\s*<h2\b", trimmed, flags=re.IGNORECASE):
         return html
-    return f"<h2>Why you need {title}?</h2>\n{html}"
+    return f"<h2>{heading}</h2>\n{html}"
 
 
 def finalize_product_description(body_html: str, title: str) -> str:
@@ -1759,19 +1812,33 @@ def finalize_product_description(body_html: str, title: str) -> str:
     return body_html
 
 
+def build_description_heading(title: str) -> str:
+    title = clamp_spaces(title)
+    variants = [
+        f"Why Use {title} in Your Next WordPress Build?",
+        f"Need {title} for a Faster Project Launch?",
+        f"Is {title} Worth Using on Client Sites?",
+        f"How Can {title} Improve Your WordPress Workflow?",
+        f"Thinking About {title} for Your Next Site?",
+    ]
+    idx = sum(ord(ch) for ch in title) % len(variants)
+    return variants[idx]
+
+
 def build_product_body_prompt(title: str, min_words: int, max_words: int) -> str:
     title = clamp_spaces(title)
+    heading = build_description_heading(title)
     min_words = max(120, int(min_words))
     max_words = max(min_words + 20, int(max_words))
     return f"""
-Write the MAIN WooCommerce product description body in HTML (do not include any membership/pricing/ads lines).
+Write the MAIN product description body in HTML (do not include any membership/pricing/ads lines).
 
 Title: {title}
 
 Rules:
 - Output MUST be JSON: {{ "body_html": "..." }}
 - Word count for the body_html ONLY: {min_words} to {max_words} words (strict).
-- First line must be: <h2>Why you need {title}?</h2>
+- First line must be: <h2>{heading}</h2>
 - Then write short paragraphs and 1 <ul> list with 4 to 6 <li> items (practical use cases).
 - Mention it's great for testing/staging, and can be used for client sites at own risk.
 - Natural, professional tone like a cool 21-year-old web developer (not salesy).
@@ -1785,12 +1852,17 @@ Rules:
 """.strip()
 
 
-def build_product_seo_prompt(product_title: str, description_html: str) -> str:
+def build_product_seo_prompt(product_title: str, description_html: str, store_related: bool) -> str:
     product_title = clamp_spaces(product_title)
     summary = strip_html(description_html or "")
     summary = re.sub(r"\s+", " ", summary).strip()[:800]
+    commerce_rule = (
+        '- Use "WooCommerce" only if it naturally fits store/ecommerce intent.'
+        if store_related
+        else '- Do not force "WooCommerce" into meta fields for this product.'
+    )
     return f"""
-Generate SEO meta title, meta description, and a focus keyword for this WooCommerce product.
+Generate SEO meta title, meta description, and a focus keyword for this product.
 
 Product title: {product_title}
 Description summary: {summary}
@@ -1801,6 +1873,7 @@ Rules:
 - meta_description: 140 to 160 characters (strict), no "official", no "free".
 - focus_keyword: 2 to 4 words, lowercase, no brand names, no "free", no "official".
 - Do not use "woocommerce pro" anywhere (WooCommerce has no Pro product).
+- {commerce_rule}
 - Do not misspell WooCommerce (never "woocomerce").
 - Use simple words WordPress devs search on Google.
 """.strip()
@@ -1873,7 +1946,8 @@ def html_word_count(html: str) -> int:
 def generate_product_title_and_description(
     gemini: MultiKeyGemini, conn: sqlite3.Connection, original_title: str
 ) -> Tuple[str, str, str, str, str, str, str, str, str, str, str]:
-    title_prompt = build_product_title_prompt(original_title)
+    store_related = is_store_related_product_title(original_title)
+    title_prompt = build_product_title_prompt(original_title, store_related)
     title_resp = gemini.generate(title_prompt, conn)
     try:
         title_data = extract_json(title_resp)
@@ -1907,6 +1981,7 @@ Rules:
 - Do not use the word "official".
 - Do not use the word "free" (any casing).
 - Do not use "WooCommerce Pro" (WooCommerce does not have a Pro product).
+- {"- Only mention WooCommerce when clearly store-related." if store_related else "- Do not mention WooCommerce in this title."}
 - If you mention WooCommerce, spell it exactly "WooCommerce" (not "woocomerce").
 - Keep it simple and SEO-friendly for WordPress dev searches.
 """.strip()
@@ -1932,7 +2007,7 @@ Rules:
     if not description_html:
         raise ValueError("Gemini returned empty product description.")
     meta_title, meta_description, focus_keyword, seo_prompt, seo_resp = generate_product_seo_meta(
-        gemini, conn, new_title, description_html
+        gemini, conn, new_title, description_html, store_related
     )
     return (
         new_title,
@@ -1954,6 +2029,7 @@ def generate_product_seo_meta(
     conn: sqlite3.Connection,
     product_title: str,
     description_html: str,
+    store_related: bool,
 ) -> Tuple[str, str, str, str, str]:
     def sanitize(text: str, *, proper_case: bool) -> str:
         text = clamp_spaces(text or "")
@@ -1994,7 +2070,7 @@ def generate_product_seo_meta(
             words = words[:4]
         return " ".join(words).strip()
 
-    prompt = build_product_seo_prompt(product_title, description_html)
+    prompt = build_product_seo_prompt(product_title, description_html, store_related)
     resp = ""
     data: Dict[str, Any] = {}
     try:
@@ -2391,7 +2467,7 @@ def build_products_context(
                 "id": row["product_id"],
                 "status": status,
                 "updated_at": row["updated_at"],
-                "last_error": row["last_error"],
+                "last_error": compact_error_message(row["last_error"]),
                 "old_title": row["old_title"],
                 "new_title": row["new_title"],
                 "permalink": row["permalink"],
@@ -2399,10 +2475,10 @@ def build_products_context(
                 "desc_done": int(row["desc_done"] or 0),
                 "seo_done": int(row["seo_done"] or 0),
                 "slug_done": int(row["slug_done"] or 0),
-                "last_title_error": row["last_title_error"],
-                "last_desc_error": row["last_desc_error"],
-                "last_seo_error": row["last_seo_error"],
-                "last_slug_error": row["last_slug_error"],
+                "last_title_error": compact_error_message(row["last_title_error"]),
+                "last_desc_error": compact_error_message(row["last_desc_error"]),
+                "last_seo_error": compact_error_message(row["last_seo_error"]),
+                "last_slug_error": compact_error_message(row["last_slug_error"]),
                 "seo_title": row["seo_title"],
                 "seo_description": row["seo_description"],
                 "seo_focus_keyword": row["seo_focus_keyword"],
@@ -2496,6 +2572,7 @@ def process_single_product(product_id: int, mode: str) -> None:
             return
 
         old_title = clamp_spaces(product.get("name", "") or "")
+        store_related = is_store_related_product_title(old_title)
         permalink = str(product.get("permalink", "") or "")
         current_desc = str(product.get("description", "") or "")
         old_slug = clamp_spaces(product.get("slug", "") or "")
@@ -2617,7 +2694,7 @@ def process_single_product(product_id: int, mode: str) -> None:
                 raise ValueError("Generated title did not match rules (50-60 chars, no official).")
 
             seo_title, seo_description, focus_keyword, _seo_prompt, _seo_resp = generate_product_seo_meta(
-                gemini, conn, new_title, current_desc
+                gemini, conn, new_title, current_desc, store_related
             )
             meta: Dict[str, str] = {}
             if runtime.get("product_meta_title_key"):
@@ -2689,7 +2766,7 @@ def process_single_product(product_id: int, mode: str) -> None:
             gemini, conn, old_title
         )
         seo_title, seo_description, focus_keyword, _seo_prompt, _seo_resp = generate_product_seo_meta(
-            gemini, conn, old_title, description_html
+            gemini, conn, old_title, description_html, store_related
         )
         meta: Dict[str, str] = {}
         if runtime.get("product_meta_title_key"):
