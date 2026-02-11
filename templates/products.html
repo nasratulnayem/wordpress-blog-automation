@@ -1,0 +1,235 @@
+{% extends "base.html" %}
+{% set title = "Products" %}
+{% block extra_head %}
+  {% if running %}
+    <meta http-equiv="refresh" content="10">
+  {% endif %}
+{% endblock %}
+{% block content %}
+  <div class="card">
+    <h2>WooCommerce Product Rewriter</h2>
+    <p class="muted">
+      Rewrites WooCommerce product titles + descriptions using Gemini.
+      Progress is saved in <code>data.db</code>, so you can stop and re-run without reprocessing.
+    </p>
+    <p class="muted small">
+      Exclusions: product ID <strong>3718</strong> and products in the <strong>membership</strong> category.
+    </p>
+  </div>
+
+  <div class="card">
+    <h3>Run</h3>
+    {% if message %}
+      <div class="muted small" style="margin-bottom:10px;">
+        <strong>Status:</strong> {{ message }}{% if message_at %} <span class="muted">({{ message_at }})</span>{% endif %}
+      </div>
+    {% endif %}
+    <form method="post" action="{{ url_for('products_sync') }}" style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;">
+      <div>
+        <label for="start_date">Start Date</label>
+        <input id="start_date" type="text" name="start_date" value="{{ default_start }}" placeholder="YYYY-MM-DD">
+      </div>
+      <div>
+        <label for="end_date">End Date</label>
+        <input id="end_date" type="text" name="end_date" value="{{ default_end }}" placeholder="YYYY-MM-DD">
+      </div>
+      <div>
+        <button class="button secondary" type="submit">Sync List</button>
+      </div>
+    </form>
+
+    <div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+      <form method="post" action="{{ url_for('products_start') }}">
+        <input type="hidden" name="start_date" value="{{ default_start }}">
+        <input type="hidden" name="end_date" value="{{ default_end }}">
+        <button class="button" type="submit">Start Bulk</button>
+      </form>
+      {% if running %}
+        <span class="status processing">running</span>
+        <form method="post" action="{{ url_for('products_stop') }}">
+          <button class="button danger" type="submit">Stop</button>
+        </form>
+      {% else %}
+        <span class="status done">idle</span>
+      {% endif %}
+      <span class="muted small">
+        Total tracked: {{ counts.total }}
+        | Pending: {{ counts.pending }}
+        | Queued: {{ counts.queued }}
+        | Processing: {{ counts.processing }}
+        | Partial: {{ counts.partial }}
+        | Done: {{ counts.done }}
+        | Skipped: {{ counts.skipped }}
+        | Errors: {{ counts.error }}
+      </span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Latest Results</h3>
+    <div class="filters" style="margin-bottom:10px;">
+      <a href="{{ url_for('products', status='all', per_page=per_page) }}" class="{% if status_filter == 'all' %}active{% endif %}">All</a>
+      <a href="{{ url_for('products', status='pending', per_page=per_page) }}" class="{% if status_filter == 'pending' %}active{% endif %}">Pending</a>
+      <a href="{{ url_for('products', status='queued', per_page=per_page) }}" class="{% if status_filter == 'queued' %}active{% endif %}">Queued</a>
+      <a href="{{ url_for('products', status='processing', per_page=per_page) }}" class="{% if status_filter == 'processing' %}active{% endif %}">Processing</a>
+      <a href="{{ url_for('products', status='partial', per_page=per_page) }}" class="{% if status_filter == 'partial' %}active{% endif %}">Partial</a>
+      <a href="{{ url_for('products', status='done', per_page=per_page) }}" class="{% if status_filter == 'done' %}active{% endif %}">Done</a>
+      <a href="{{ url_for('products', status='error', per_page=per_page) }}" class="{% if status_filter == 'error' %}active{% endif %}">Errors</a>
+      <a href="{{ url_for('products', status='skipped', per_page=per_page) }}" class="{% if status_filter == 'skipped' %}active{% endif %}">Skipped</a>
+    </div>
+    <form method="get" action="{{ url_for('products') }}" style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-bottom:10px;">
+      <input type="hidden" name="status" value="{{ status_filter }}">
+      <input type="hidden" name="page" value="1">
+      <div>
+        <label for="per_page" class="small muted" style="margin-bottom:6px;">Per Page</label>
+        <select id="per_page" name="per_page" style="padding:8px 10px; border:1px solid #d6dbe0; border-radius:6px;">
+          <option value="50" {% if per_page == 50 %}selected{% endif %}>50</option>
+          <option value="200" {% if per_page == 200 %}selected{% endif %}>200</option>
+          <option value="500" {% if per_page == 500 %}selected{% endif %}>500</option>
+          <option value="1000" {% if per_page == 1000 %}selected{% endif %}>1000</option>
+        </select>
+      </div>
+      <div>
+        <button class="button secondary" type="submit">Apply</button>
+      </div>
+    </form>
+
+    {% if items %}
+      <form id="bulk-products-form" method="post" action="{{ url_for('products_bulk_do') }}" class="card" style="margin-bottom:12px;">
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+          <label style="margin:0;">
+            Mode:
+            <select name="mode" style="padding:8px 10px; border:1px solid #d6dbe0; border-radius:6px;">
+              <option value="both">Title + Desc + SEO</option>
+              <option value="title">Title + SEO</option>
+              <option value="description">Desc + SEO</option>
+            </select>
+          </label>
+          <button class="button" type="submit">Do Selected</button>
+          <span class="muted small">Showing {{ filtered_total }} matching products. Page {{ current_page }} of {{ total_pages }}.</span>
+        </div>
+      </form>
+
+      <table>
+        <thead>
+          <tr>
+            <th><input id="check-all-products" type="checkbox"></th>
+            <th>ID</th>
+            <th>Old Title</th>
+            <th>New Title</th>
+            <th>Title</th>
+            <th>Desc</th>
+            <th>SEO</th>
+            <th>Slug</th>
+            <th>Status</th>
+            <th>Updated</th>
+            <th>Actions</th>
+            <th>View</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for it in items %}
+            <tr>
+              <td>
+                {% if it.status != "skipped" %}
+                  <input type="checkbox" name="product_ids" value="{{ it.id }}" form="bulk-products-form">
+                {% endif %}
+              </td>
+              <td class="small muted">{{ it.id }}</td>
+              <td>{{ it.old_title or "-" }}</td>
+              <td><strong>{{ it.new_title or "-" }}</strong></td>
+              <td class="small muted">
+                {% if it.title_done %}done{% else %}-{% endif %}
+                {% if it.last_title_error %}
+                  <div class="small muted">{{ it.last_title_error }}</div>
+                {% endif %}
+              </td>
+              <td class="small muted">
+                {% if it.desc_done %}done{% else %}-{% endif %}
+                {% if it.last_desc_error %}
+                  <div class="small muted">{{ it.last_desc_error }}</div>
+                {% endif %}
+              </td>
+              <td class="small muted">
+                {% if it.seo_done %}done{% else %}-{% endif %}
+                {% if it.last_seo_error %}
+                  <div class="small muted">{{ it.last_seo_error }}</div>
+                {% endif %}
+                {% if it.seo_focus_keyword %}
+                  <div class="small muted">kw: {{ it.seo_focus_keyword }}</div>
+                {% endif %}
+              </td>
+              <td class="small muted">
+                {% if it.slug_done %}done{% else %}-{% endif %}
+                {% if it.new_slug %}
+                  <div class="small muted">{{ it.new_slug }}</div>
+                {% endif %}
+                {% if it.last_slug_error %}
+                  <div class="small muted">{{ it.last_slug_error }}</div>
+                {% endif %}
+              </td>
+              <td>
+                <span class="status {{ it.status }}">{{ it.status }}</span>
+                {% if it.last_error %}
+                  <div class="small muted">{{ it.last_error }}</div>
+                {% endif %}
+              </td>
+              <td class="small muted">{{ it.updated_at or "-" }}</td>
+              <td class="actions">
+                {% if it.status != "skipped" %}
+                  <form method="post" action="{{ url_for('products_do', product_id=it.id) }}">
+                    <input type="hidden" name="mode" value="title">
+                    <button class="button secondary" type="submit">Do Title</button>
+                  </form>
+                  <form method="post" action="{{ url_for('products_do', product_id=it.id) }}">
+                    <input type="hidden" name="mode" value="description">
+                    <button class="button secondary" type="submit">Do Desc</button>
+                  </form>
+                  <form method="post" action="{{ url_for('products_do', product_id=it.id) }}">
+                    <input type="hidden" name="mode" value="both">
+                    <button class="button" type="submit">Do</button>
+                  </form>
+                {% else %}
+                  <span class="small muted">-</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if it.permalink %}
+                  <a class="small muted" href="{{ it.permalink }}" target="_blank" rel="noreferrer">Open</a>
+                {% else %}
+                  <span class="small muted">-</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      {% if total_pages > 1 %}
+        <div class="card pagination">
+          {% if current_page > 1 %}
+            <a href="{{ url_for('products', status=status_filter, page=current_page-1, per_page=per_page) }}">Prev</a>
+          {% endif %}
+          <span>{{ current_page }}</span>
+          {% if current_page < total_pages %}
+            <a href="{{ url_for('products', status=status_filter, page=current_page+1, per_page=per_page) }}">Next</a>
+          {% endif %}
+          <span class="muted small">Per page: {{ per_page }}</span>
+        </div>
+      {% endif %}
+    {% else %}
+      <p class="muted">No product rewrites yet. Click Start to run the job.</p>
+    {% endif %}
+  </div>
+
+  <script>
+    (function () {
+      var all = document.getElementById("check-all-products");
+      if (!all) return;
+      all.addEventListener("change", function () {
+        var boxes = document.querySelectorAll('input[name="product_ids"]');
+        for (var i = 0; i < boxes.length; i++) boxes[i].checked = all.checked;
+      });
+    })();
+  </script>
+{% endblock %}

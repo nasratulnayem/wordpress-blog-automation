@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% set title = "Posts" %}
+{% block extra_head %}
+  {% if auto_refresh %}
+    <meta http-equiv="refresh" content="10">
+  {% endif %}
+{% endblock %}
+{% block content %}
+  <div class="card">
+    <h2>Post Queue</h2>
+    <p class="muted">Total: {{ counts.total }} | Done: {{ counts.done }} | Pending: {{ counts.pending }} | Processing: {{ counts.processing }} | Queued: {{ counts.queued }} | Errors: {{ counts.errors }} | Canceled: {{ counts.canceled }}</p>
+    <div class="filters">
+      <a href="{{ url_for('index', status='all') }}" class="{% if status_filter == 'all' %}active{% endif %}">All</a>
+      <a href="{{ url_for('index', status='pending') }}" class="{% if status_filter == 'pending' %}active{% endif %}">Pending</a>
+      <a href="{{ url_for('index', status='done') }}" class="{% if status_filter == 'done' %}active{% endif %}">Done</a>
+      <a href="{{ url_for('index', status='processing') }}" class="{% if status_filter == 'processing' %}active{% endif %}">Processing</a>
+      <a href="{{ url_for('index', status='queued') }}" class="{% if status_filter == 'queued' %}active{% endif %}">Queued</a>
+      <a href="{{ url_for('index', status='error') }}" class="{% if status_filter == 'error' %}active{% endif %}">Errors</a>
+      <a href="{{ url_for('index', status='canceled') }}" class="{% if status_filter == 'canceled' %}active{% endif %}">Canceled</a>
+      <a href="{{ url_for('index', status=status_filter, refresh=1) }}">Refresh</a>
+    </div>
+  </div>
+
+  {% if missing_config %}
+    <div class="card">
+      <p>Configuration is incomplete. Open Settings to add credentials and prompt details.</p>
+      <a class="button" href="{{ url_for('settings') }}">Open Settings</a>
+    </div>
+  {% endif %}
+
+  <form id="bulk-form" class="card" method="post" action="{{ url_for('bulk_generate') }}">
+    <div style="display:flex; align-items:center; gap:10px;">
+      <button class="button" type="submit">Bulk Generate</button>
+      <span class="muted small">Select posts from the list and queue them together.</span>
+    </div>
+  </form>
+
+  <div class="card">
+    {% if posts %}
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th>Title</th>
+            <th>Status</th>
+            <th>Generated</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for post in posts %}
+            <tr>
+              <td>
+                <input type="checkbox" name="post_ids" value="{{ post.id }}" form="bulk-form">
+              </td>
+              <td>
+                <strong>{{ post.title or "(untitled)" }}</strong><br>
+                <a class="small muted" href="{{ post.link }}" target="_blank" rel="noreferrer">View on WordPress</a>
+              </td>
+              <td>
+                <span class="status {{ post.status }}">{{ post.status }}</span>
+                {% if post.last_error %}
+                  <div class="small muted">{{ post.last_error }}</div>
+                {% endif %}
+              </td>
+              <td class="small muted">{{ post.generated_at or "-" }}</td>
+              <td class="actions">
+                <form method="post" action="{{ url_for('generate', post_id=post.id) }}">
+                  <button class="button" type="submit">Generate</button>
+                </form>
+                {% if post.status in ["processing", "queued"] %}
+                  <form method="post" action="{{ url_for('cancel', post_id=post.id) }}">
+                    <button class="button danger" type="submit">Cancel</button>
+                  </form>
+                {% endif %}
+                <a class="button secondary" href="{{ url_for('logs', post_id=post.id, next=request.full_path) }}">Logs</a>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">No posts to display.</p>
+    {% endif %}
+  </div>
+
+  {% if total_pages > 1 %}
+    <div class="card pagination">
+      {% for page_num in pages %}
+        {% if page_num == current_page %}
+          <span>{{ page_num }}</span>
+        {% else %}
+          <a href="{{ url_for('index', status=status_filter, page=page_num) }}">{{ page_num }}</a>
+        {% endif %}
+      {% endfor %}
+      <span class="muted small">Page {{ current_page }} of {{ total_pages }}</span>
+    </div>
+  {% endif %}
+{% endblock %}

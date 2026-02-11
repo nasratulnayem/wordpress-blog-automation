@@ -28,6 +28,8 @@ except Exception:  # noqa: BLE001
 ENV_WP_BASE_URL = os.getenv("WP_BASE_URL", "").rstrip("/")
 ENV_WP_USERNAME = os.getenv("WP_USERNAME", "")
 ENV_WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+API_KEYS_PATH = os.path.join(BASE_DIR, "api.txt")
 ENV_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 ENV_GEMINI_API_KEYS = os.getenv("GEMINI_API_KEYS", "").strip()
 ENV_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
@@ -36,6 +38,13 @@ ENV_CUSTOM_PROMPT = os.getenv("CUSTOM_PROMPT", "").strip()
 
 ENV_META_TITLE_KEY = os.getenv("META_TITLE_KEY", "yoast_wpseo_title")
 ENV_META_DESCRIPTION_KEY = os.getenv("META_DESCRIPTION_KEY", "yoast_wpseo_metadesc")
+ENV_PRODUCT_META_TITLE_KEY = os.getenv("PRODUCT_META_TITLE_KEY", "_yoast_wpseo_title")
+ENV_PRODUCT_META_DESCRIPTION_KEY = os.getenv(
+    "PRODUCT_META_DESCRIPTION_KEY", "_yoast_wpseo_metadesc"
+)
+ENV_PRODUCT_FOCUS_KEYWORD_KEY = os.getenv(
+    "PRODUCT_FOCUS_KEYWORD_KEY", "_yoast_wpseo_focuskw"
+)
 ENV_USE_EXCERPT_FOR_META_DESCRIPTION = os.getenv(
     "USE_EXCERPT_FOR_META_DESCRIPTION", "true"
 ).lower() in ("1", "true", "yes")
@@ -109,6 +118,33 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS product_rewrite_status (
+                product_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                updated_at TEXT,
+                last_error TEXT,
+                old_title TEXT,
+                new_title TEXT,
+                permalink TEXT
+            )
+            """
+        )
+        ensure_product_rewrite_schema(conn)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_rewrite_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                prompt_title TEXT NOT NULL,
+                response_title TEXT NOT NULL,
+                prompt_description TEXT NOT NULL,
+                response_description TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS post_status (
                 post_id INTEGER PRIMARY KEY,
                 status TEXT NOT NULL,
@@ -132,6 +168,61 @@ def init_db() -> None:
             """
         )
     conn.close()
+
+
+def ensure_product_rewrite_schema(conn: sqlite3.Connection) -> None:
+    cols = conn.execute("PRAGMA table_info(product_rewrite_status)").fetchall()
+    names = {row[1] for row in cols}  # (cid, name, type, notnull, dflt_value, pk)
+    # Per-piece completion so "Do Title" and "Do Desc" can be tracked separately.
+    if "title_done" not in names:
+        conn.execute(
+            "ALTER TABLE product_rewrite_status ADD COLUMN title_done INTEGER NOT NULL DEFAULT 0"
+        )
+    if "desc_done" not in names:
+        conn.execute(
+            "ALTER TABLE product_rewrite_status ADD COLUMN desc_done INTEGER NOT NULL DEFAULT 0"
+        )
+    if "seo_done" not in names:
+        conn.execute(
+            "ALTER TABLE product_rewrite_status ADD COLUMN seo_done INTEGER NOT NULL DEFAULT 0"
+        )
+    if "last_title_error" not in names:
+        conn.execute(
+            "ALTER TABLE product_rewrite_status ADD COLUMN last_title_error TEXT"
+        )
+    if "last_desc_error" not in names:
+        conn.execute("ALTER TABLE product_rewrite_status ADD COLUMN last_desc_error TEXT")
+    if "last_seo_error" not in names:
+        conn.execute("ALTER TABLE product_rewrite_status ADD COLUMN last_seo_error TEXT")
+    if "seo_title" not in names:
+        conn.execute("ALTER TABLE product_rewrite_status ADD COLUMN seo_title TEXT")
+    if "seo_description" not in names:
+        conn.execute("ALTER TABLE product_rewrite_status ADD COLUMN seo_description TEXT")
+    if "seo_focus_keyword" not in names:
+        conn.execute(
+            "ALTER TABLE product_rewrite_status ADD COLUMN seo_focus_keyword TEXT"
+        )
+    if "slug_done" not in names:
+        conn.execute(
+            "ALTER TABLE product_rewrite_status ADD COLUMN slug_done INTEGER NOT NULL DEFAULT 0"
+        )
+    if "last_slug_error" not in names:
+        conn.execute("ALTER TABLE product_rewrite_status ADD COLUMN last_slug_error TEXT")
+    if "old_slug" not in names:
+        conn.execute("ALTER TABLE product_rewrite_status ADD COLUMN old_slug TEXT")
+    if "new_slug" not in names:
+        conn.execute("ALTER TABLE product_rewrite_status ADD COLUMN new_slug TEXT")
+
+    # Backfill flags for older rows so filters (Done/Partial) behave as expected.
+    conn.execute(
+        "UPDATE product_rewrite_status SET title_done = 1 WHERE status = 'done' AND title_done = 0"
+    )
+    conn.execute(
+        "UPDATE product_rewrite_status SET desc_done = 1 WHERE status = 'done' AND desc_done = 0"
+    )
+    conn.execute(
+        "UPDATE product_rewrite_status SET seo_done = 1 WHERE status = 'done' AND seo_done = 0"
+    )
 
 
 @app.before_request
@@ -236,6 +327,20 @@ class WordPressClient:
         resp.raise_for_status()
         return resp.json()
 
+    def update_product_meta(self, product_id: int, meta: Dict[str, str]) -> bool:
+        """
+        Best-effort fallback for SEO plugins that only read WP postmeta, not WC meta_data.
+        Requires the product CPT endpoint to be enabled at /wp-json/wp/v2/product/<id>.
+        """
+        if not meta:
+            return True
+        url = self._url(f"/wp-json/wp/v2/product/{product_id}")
+        resp = requests.post(url, json={"meta": meta}, auth=self.auth, timeout=45)
+        if resp.status_code in (404, 400, 401, 403):
+            return False
+        resp.raise_for_status()
+        return True
+
     def find_or_create_tag(self, name: str) -> Optional[int]:
         name = name.strip()
         if not name:
@@ -251,6 +356,97 @@ class WordPressClient:
             return None
         create.raise_for_status()
         return create.json()["id"]
+
+
+class WooCommerceClient:
+    def __init__(self, base_url: str, username: str, app_password: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.auth = (username, app_password)
+
+    def _url(self, path: str) -> str:
+        return f"{self.base_url}{path}"
+
+    def list_products(
+        self,
+        page: int = 1,
+        per_page: int = 100,
+        after: str = "",
+        before: str = "",
+        orderby: str = "date",
+        order: str = "desc",
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        url = self._url("/wp-json/wc/v3/products")
+        params: Dict[str, Any] = {
+            "per_page": per_page,
+            "page": page,
+            "orderby": orderby,
+            "order": order,
+        }
+        if after:
+            params["after"] = after
+        if before:
+            params["before"] = before
+        resp = requests.get(url, params=params, auth=self.auth, timeout=45)
+        retries = 2
+        while True:
+            try:
+                resp.raise_for_status()
+                break
+            except requests.HTTPError as exc:
+                if resp.status_code in (502, 503, 504) and retries > 0:
+                    retries -= 1
+                    time.sleep(1)
+                    resp = requests.get(url, params=params, auth=self.auth, timeout=45)
+                    continue
+                raise exc
+        total_pages = int(resp.headers.get("X-WP-TotalPages", "1") or "1")
+        return resp.json(), total_pages
+
+    def list_all_products(
+        self,
+        per_page: int = 100,
+        after: str = "",
+        before: str = "",
+        max_pages: int = 100,
+    ) -> List[Dict[str, Any]]:
+        products: List[Dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            batch, total_pages = self.list_products(
+                page=page, per_page=per_page, after=after, before=before
+            )
+            products.extend(batch)
+            if page >= total_pages or len(batch) < per_page:
+                break
+        return products
+
+    def update_product(
+        self,
+        product_id: int,
+        *,
+        name: Optional[str] = None,
+        description_html: Optional[str] = None,
+        slug: Optional[str] = None,
+        meta: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        url = self._url(f"/wp-json/wc/v3/products/{product_id}")
+        payload: Dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if description_html is not None:
+            payload["description"] = description_html
+        if slug is not None:
+            payload["slug"] = slug
+        if meta:
+            payload["meta_data"] = [{"key": k, "value": v} for k, v in meta.items() if k and v]
+        resp = requests.put(url, json=payload, auth=self.auth, timeout=45)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_product(self, product_id: int) -> Dict[str, Any]:
+        url = self._url(f"/wp-json/wc/v3/products/{product_id}")
+        resp = requests.get(url, auth=self.auth, timeout=45)
+        resp.raise_for_status()
+        return resp.json()
 
 
 def redirect_back(default: str = "index") -> str:
@@ -453,40 +649,52 @@ def build_prompt(title: str, inbound_links: List[str], custom_prompt: str) -> st
             custom_text = f"\nAdditional instructions:\n{cleaned_custom}\n"
 
     return f"""
-You are writing a professional blog post.
+You are writing a professional, SEO-focused micro blog post that answers one clear question.
 
-Topic: {title}
-
-Rules:
-- About 2000 words.
-- Use plain language and short sentences.
+Question/Topic: {title}
+Method: Simple PAA content structure
+- One question = one page (non-negotiable). Do not combine multiple questions into one article.
+- About 2000 words total.
+- Simple, direct language. Short sentences.
 - No hype, no buzzwords, no clichés.
 - No special characters or emojis.
 - Do not use headings like Conclusion or Final thoughts.
-- Start with a short intro paragraph, not a title heading.
+- Start with a short intro paragraph (1-2 sentences), not a title heading.
+- Use clear H2 and H3 structure.
+- Put the direct answer in the first 40 words after the H2 (required).
+- Add 2 to 3 related H2 sub-questions (People Also Ask style).
+- Under each H2, use short H3s for supporting details, steps, or examples.
+- Use lists where helpful.
 - Keep tone natural, helpful, and human.
 - Stay on topic and do not add unrelated content.
-- Use clear H2 and H3 structure.
-- Show evidence of research with specific, accurate details about the topic.
 - Make the content valuable and practical for the reader.
 - Make my role clear in the narrative (the brand/operator behind the site) without overpromising.
 - Ensure each post is distinct in structure and examples, even with similar topics.
-- Use lists where helpful.
 - Do not show raw URLs as text. Use anchor text for all links.
+- Add a 1-line TL;DR near the top or bottom.
 
 Internal workflow:
-- Derive 10 questions a writer would ask to make this unique.
+- Derive 6 to 8 questions a writer would ask to make this unique.
 - Answer those questions inside the post content without showing them.
 
 Links:
-- Include exactly 4 outbound links to reputable, live sources.
+- Include exactly 2 outbound links to reputable, live sources.
 - Include exactly 2 inbound links from this list:
+- The first inbound link must be the main guide (Medium or main site) and be contextual.
+- The second inbound link should point to a related PAA post (contextual).
 {inbound_text}
+- Include exactly 1 contextual link to gplmama.com:
+  - Place it after explaining GPL.
+  - Use neutral anchor text (not exact-match/affiliate language).
+  - Do not place it early in the article.
+  - Add rel="nofollow" to that link.
 
 SEO:
 - Provide a meta title (50-60 chars).
 - Provide a meta description (140-160 chars).
 - Provide 5 to 8 tags.
+- Add FAQ schema (JSON-LD) with exactly 1 question and a 2-3 line answer.
+- The FAQ question must match the post title/question.
 
 Output format:
 Return only valid JSON with these keys:
@@ -567,6 +775,315 @@ def log_generation(
             meta_title,
             meta_description,
             ", ".join(tags),
+        ),
+    )
+
+
+def update_product_status(
+    conn: sqlite3.Connection,
+    product_id: int,
+    status: str,
+    error: Optional[str] = None,
+    old_title: str = "",
+    new_title: str = "",
+    permalink: str = "",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO product_rewrite_status
+            (product_id, status, updated_at, last_error, old_title, new_title, permalink)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(product_id) DO UPDATE SET
+            status=excluded.status,
+            updated_at=excluded.updated_at,
+            last_error=excluded.last_error,
+            old_title=(CASE WHEN excluded.old_title != '' THEN excluded.old_title ELSE product_rewrite_status.old_title END),
+            new_title=(CASE WHEN excluded.new_title != '' THEN excluded.new_title ELSE product_rewrite_status.new_title END),
+            permalink=(CASE WHEN excluded.permalink != '' THEN excluded.permalink ELSE product_rewrite_status.permalink END)
+        """,
+        (
+            product_id,
+            status,
+            datetime.now(timezone.utc).isoformat(),
+            error,
+            old_title,
+            new_title,
+            permalink,
+        ),
+    )
+
+
+def update_product_piece_flags(
+    conn: sqlite3.Connection,
+    product_id: int,
+    *,
+    title_done: Optional[int] = None,
+    desc_done: Optional[int] = None,
+    seo_done: Optional[int] = None,
+    slug_done: Optional[int] = None,
+    last_title_error: Optional[str] = None,
+    last_desc_error: Optional[str] = None,
+    last_seo_error: Optional[str] = None,
+    last_slug_error: Optional[str] = None,
+    seo_title: Optional[str] = None,
+    seo_description: Optional[str] = None,
+    seo_focus_keyword: Optional[str] = None,
+    old_slug: Optional[str] = None,
+    new_slug: Optional[str] = None,
+) -> None:
+    fields = []
+    params: List[Any] = []
+    if title_done is not None:
+        fields.append("title_done = ?")
+        params.append(int(title_done))
+    if desc_done is not None:
+        fields.append("desc_done = ?")
+        params.append(int(desc_done))
+    if seo_done is not None:
+        fields.append("seo_done = ?")
+        params.append(int(seo_done))
+    if slug_done is not None:
+        fields.append("slug_done = ?")
+        params.append(int(slug_done))
+    if last_title_error is not None:
+        fields.append("last_title_error = ?")
+        params.append(last_title_error)
+    if last_desc_error is not None:
+        fields.append("last_desc_error = ?")
+        params.append(last_desc_error)
+    if last_seo_error is not None:
+        fields.append("last_seo_error = ?")
+        params.append(last_seo_error)
+    if last_slug_error is not None:
+        fields.append("last_slug_error = ?")
+        params.append(last_slug_error)
+    if seo_title is not None:
+        fields.append("seo_title = ?")
+        params.append(seo_title)
+    if seo_description is not None:
+        fields.append("seo_description = ?")
+        params.append(seo_description)
+    if seo_focus_keyword is not None:
+        fields.append("seo_focus_keyword = ?")
+        params.append(seo_focus_keyword)
+    if old_slug is not None:
+        fields.append("old_slug = ?")
+        params.append(old_slug)
+    if new_slug is not None:
+        fields.append("new_slug = ?")
+        params.append(new_slug)
+    if not fields:
+        return
+    fields.append("updated_at = ?")
+    params.append(datetime.now(timezone.utc).isoformat())
+    params.append(product_id)
+    conn.execute(
+        f"UPDATE product_rewrite_status SET {', '.join(fields)} WHERE product_id = ?",
+        tuple(params),
+    )
+
+
+def compute_product_overall_status(row: sqlite3.Row) -> str:
+    current = (row["status"] or "").strip()
+    if current == "skipped":
+        return "skipped"
+    if current == "done":
+        return "done"
+    if current == "processing":
+        return "processing"
+    if current == "queued":
+        return "queued"
+    if current == "error":
+        return "error"
+    title_done = int(row["title_done"] or 0)
+    desc_done = int(row["desc_done"] or 0)
+    seo_done = int(row["seo_done"] or 0)
+    slug_done = int(row["slug_done"] or 0)
+    if title_done and desc_done and seo_done and slug_done:
+        return "done"
+    if title_done or desc_done or seo_done or slug_done:
+        return "partial"
+    return current or "pending"
+
+
+def sync_products_to_db(start_date: str, end_date: str) -> None:
+    runtime = get_runtime_config()
+    if not (
+        runtime["wp_base_url"]
+        and runtime["wp_username"]
+        and runtime["wp_app_password"]
+    ):
+        return
+
+    set_product_bulk_message("Sync starting...")
+    conn = get_db()
+    wc_client = WooCommerceClient(
+        runtime["wp_base_url"], runtime["wp_username"], runtime["wp_app_password"]
+    )
+    try:
+        after = f"{start_date}T00:00:00Z"
+        before = f"{end_date}T23:59:59Z"
+        per_page = 100
+        max_pages = 200
+        first_batch, total_pages = wc_client.list_products(
+            page=1, per_page=per_page, after=after, before=before
+        )
+        total_pages = min(total_pages, max_pages)
+
+        discovered = 0
+        inserted = 0
+        skipped = 0
+
+        def upsert(product: Dict[str, Any]) -> None:
+            nonlocal discovered, inserted, skipped
+            product_id = int(product.get("id") or 0)
+            if not product_id:
+                return
+            discovered += 1
+            old_title = clamp_spaces(product.get("name", "") or "")
+            permalink = str(product.get("permalink", "") or "")
+            old_slug = clamp_spaces(product.get("slug", "") or "")
+
+            if product_id == 3718 or wc_is_membership_product(product):
+                reason = (
+                    "Skipped: excluded product_id 3718."
+                    if product_id == 3718
+                    else "Skipped: membership category."
+                )
+                with conn:
+                    update_product_status(
+                        conn,
+                        product_id,
+                        "skipped",
+                        reason,
+                        old_title=old_title,
+                        permalink=permalink,
+                    )
+                    update_product_piece_flags(conn, product_id, old_slug=old_slug)
+                skipped += 1
+                return
+
+            existing = conn.execute(
+                "SELECT status FROM product_rewrite_status WHERE product_id = ?",
+                (product_id,),
+            ).fetchone()
+            if existing and (existing["status"] or "") == "skipped":
+                return
+
+            # Don't overwrite done/partial progress; just ensure it stays listed.
+            if existing and (existing["status"] or "") in ("done", "partial"):
+                with conn:
+                    conn.execute(
+                        """
+                        UPDATE product_rewrite_status
+                        SET old_title = ?, permalink = ?, updated_at = ?
+                        WHERE product_id = ?
+                        """,
+                        (
+                            old_title,
+                            permalink,
+                            datetime.now(timezone.utc).isoformat(),
+                            product_id,
+                        ),
+                    )
+                    update_product_piece_flags(conn, product_id, old_slug=old_slug)
+                return
+
+            with conn:
+                update_product_status(
+                    conn,
+                    product_id,
+                    "pending",
+                    None,
+                    old_title=old_title,
+                    permalink=permalink,
+                )
+                update_product_piece_flags(conn, product_id, old_slug=old_slug)
+            inserted += 1
+
+        set_product_bulk_message(f"Sync fetching 1/{total_pages}...")
+        for product in first_batch:
+            if product_bulk_should_stop():
+                break
+            upsert(product)
+
+        for page in range(2, total_pages + 1):
+            if product_bulk_should_stop():
+                break
+            set_product_bulk_message(f"Sync fetching {page}/{total_pages}...")
+            batch, _tp = wc_client.list_products(
+                page=page, per_page=per_page, after=after, before=before
+            )
+            for product in batch:
+                if product_bulk_should_stop():
+                    break
+                upsert(product)
+            if len(batch) < per_page:
+                break
+
+        set_product_bulk_message(
+            f"Sync done. Found {discovered}. Added/updated {inserted}. Skipped {skipped}."
+        )
+    finally:
+        conn.close()
+
+
+def get_product_status_map(conn: sqlite3.Connection) -> Dict[int, sqlite3.Row]:
+    rows = conn.execute("SELECT * FROM product_rewrite_status").fetchall()
+    return {row["product_id"]: row for row in rows}
+
+
+def product_bulk_should_stop() -> bool:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT value FROM app_config WHERE key = ?",
+        ("product_bulk_stop",),
+    ).fetchone()
+    conn.close()
+    return bool(row and (row["value"] or "").strip() in ("1", "true", "yes"))
+
+
+def set_product_bulk_flag(key: str, value: str) -> None:
+    conn = get_db()
+    with conn:
+        set_config(conn, {key: value})
+    conn.close()
+
+
+def set_product_bulk_message(message: str) -> None:
+    conn = get_db()
+    with conn:
+        set_config(
+            conn,
+            {
+                "product_bulk_message": message,
+                "product_bulk_message_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    conn.close()
+
+
+def log_product_rewrite(
+    conn: sqlite3.Connection,
+    product_id: int,
+    prompt_title: str,
+    response_title: str,
+    prompt_description: str,
+    response_description: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO product_rewrite_log
+            (product_id, created_at, prompt_title, response_title, prompt_description, response_description)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            product_id,
+            datetime.now(timezone.utc).isoformat(),
+            prompt_title,
+            response_title,
+            prompt_description,
+            response_description,
         ),
     )
 
@@ -755,6 +1272,12 @@ def get_config(conn: sqlite3.Connection) -> Dict[str, str]:
         config["meta_title_key"] = ENV_META_TITLE_KEY
     if "meta_description_key" not in config:
         config["meta_description_key"] = ENV_META_DESCRIPTION_KEY
+    if "product_meta_title_key" not in config:
+        config["product_meta_title_key"] = ENV_PRODUCT_META_TITLE_KEY
+    if "product_meta_description_key" not in config:
+        config["product_meta_description_key"] = ENV_PRODUCT_META_DESCRIPTION_KEY
+    if "product_focus_keyword_key" not in config:
+        config["product_focus_keyword_key"] = ENV_PRODUCT_FOCUS_KEYWORD_KEY
     if "use_excerpt_for_meta_description" not in config:
         config["use_excerpt_for_meta_description"] = (
             "true" if ENV_USE_EXCERPT_FOR_META_DESCRIPTION else "false"
@@ -793,14 +1316,42 @@ def parse_api_keys(raw: str) -> List[str]:
     parts = re.split(r"[,\n]", raw)
     return [part.strip() for part in parts if part.strip()]
 
+def read_api_keys_file(path: str) -> List[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = [line.strip() for line in handle.readlines()]
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return []
+    keys = []
+    for line in lines:
+        if not line or line.startswith("#"):
+            continue
+        keys.append(line)
+    return keys
+
+
+def dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 def get_runtime_config() -> Dict[str, Any]:
     conn = get_db()
     config = get_config(conn)
     conn.close()
+    file_keys = read_api_keys_file(API_KEYS_PATH)
     gemini_api_keys = parse_api_keys(config.get("gemini_api_keys", ""))
     if not gemini_api_keys and config.get("gemini_api_key"):
         gemini_api_keys = [config.get("gemini_api_key", "").strip()]
+    if file_keys:
+        gemini_api_keys = dedupe_preserve_order(file_keys + gemini_api_keys)
     return {
         "wp_base_url": config.get("wp_base_url", "").rstrip("/"),
         "wp_username": config.get("wp_username", ""),
@@ -812,6 +1363,9 @@ def get_runtime_config() -> Dict[str, Any]:
         "custom_prompt": config.get("custom_prompt", "").strip(),
         "meta_title_key": config.get("meta_title_key", ""),
         "meta_description_key": config.get("meta_description_key", ""),
+        "product_meta_title_key": config.get("product_meta_title_key", "").strip(),
+        "product_meta_description_key": config.get("product_meta_description_key", "").strip(),
+        "product_focus_keyword_key": config.get("product_focus_keyword_key", "").strip(),
         "use_excerpt_for_meta_description": config.get(
             "use_excerpt_for_meta_description", "true"
         ).lower()
@@ -1008,6 +1562,1209 @@ def build_index_context(
     }
 
 
+def clamp_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def remove_free_words(text: str) -> str:
+    cleaned = re.sub(r"\bfree\b", "", text or "", flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+[-|:]\s+", " - ", cleaned).strip()
+    return cleaned
+
+
+_WOOCOMMERCE_TYPO_RE = re.compile(
+    r"\bwoo\s*com+\s*er(?:ce|se)\b|\bwoocomerce\b|\bwoocommerse\b|\bwoocomerce\b",
+    flags=re.IGNORECASE,
+)
+
+
+def normalize_woocommerce_spelling(text: str, *, proper_case: bool = True) -> str:
+    """
+    Fix common WooCommerce misspellings in human-visible text.
+    """
+    if not text:
+        return ""
+    replacement = "WooCommerce" if proper_case else "woocommerce"
+    return _WOOCOMMERCE_TYPO_RE.sub(replacement, text)
+
+
+def slugify(text: str) -> str:
+    text = unescape(strip_html(text or ""))
+    text = remove_free_words(text)
+    text = re.sub(r"\bofficial\b", "", text, flags=re.IGNORECASE)
+    text = text.lower()
+    text = re.sub(r"['’]", "", text)
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    return text
+
+
+def generate_product_slug(title: str, max_len: int = 55) -> str:
+    raw = slugify(title)
+    if not raw:
+        return ""
+    stop = {
+        "premium",
+        "download",
+        "the",
+        "and",
+        "or",
+        "for",
+        "with",
+        "templates",
+        "template",
+        "wordpress",
+        "woocommerce",
+    }
+    parts = [p for p in raw.split("-") if p and p not in stop]
+    if not parts:
+        parts = [p for p in raw.split("-") if p]
+    parts = parts[:6]
+    slug = "-".join(parts)
+    if len(slug) > max_len:
+        slug = slug[:max_len].rstrip("-")
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug
+
+
+def title_len_ok(title: str) -> bool:
+    n = len((title or "").strip())
+    return 50 <= n <= 60
+
+
+def wc_is_membership_product(product: Dict[str, Any]) -> bool:
+    cats = product.get("categories") or []
+    for cat in cats:
+        slug = str(cat.get("slug", "") or "").strip().lower()
+        name = str(cat.get("name", "") or "").strip().lower()
+        if slug == "membership":
+            return True
+        if "membership" in name:
+            return True
+    return False
+
+
+def wc_meta_has(product: Dict[str, Any], key: str) -> bool:
+    meta_data = product.get("meta_data") or []
+    for item in meta_data:
+        if str(item.get("key", "")) == key:
+            return True
+    return False
+
+
+def ensure_wc_product_meta(
+    wc_client: WooCommerceClient,
+    wp_client: WordPressClient,
+    product_id: int,
+    meta: Dict[str, str],
+) -> Tuple[bool, str]:
+    """
+    Ensure meta exists after update. If WC response doesn't persist it, try WP v2 product endpoint.
+    """
+    if not meta:
+        return False, "No meta keys configured."
+    try:
+        prod = wc_client.get_product(product_id)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Meta verify failed (fetch): {exc}"
+    missing = [k for k in meta.keys() if not wc_meta_has(prod, k)]
+    if not missing:
+        return True, ""
+
+    # Fallback: try updating via WP REST product endpoint.
+    ok = wp_client.update_product_meta(product_id, meta)
+    if not ok:
+        return False, f"Meta not saved for keys: {', '.join(missing)}"
+    try:
+        prod2 = wc_client.get_product(product_id)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Meta verify failed (refetch): {exc}"
+    missing2 = [k for k in meta.keys() if not wc_meta_has(prod2, k)]
+    if missing2:
+        return False, f"Meta not saved for keys: {', '.join(missing2)}"
+    return True, ""
+
+
+def build_product_title_prompt(original_title: str) -> str:
+    original_title = clamp_spaces(original_title)
+    return f"""
+Rewrite this WooCommerce product title for SEO.
+
+Original title: {original_title}
+
+Rules:
+- Output MUST be JSON: {{ "title": "..." }}
+- 1 title only.
+- 50 to 60 characters (strict).
+- Remove the word "free" / "Free" (and any similar "free ..." wording).
+- Do not use the word "official".
+- Do not use "WooCommerce Pro" (WooCommerce does not have a Pro product).
+- If you mention WooCommerce, spell it exactly "WooCommerce" (not "woocomerce").
+- Use simple words WordPress developers search on Google.
+- You may use: premium, pro, download.
+- Keep it natural, professional, not hype.
+- Do not add quotes or emojis.
+""".strip()
+
+
+def build_product_description_prompt(final_title: str) -> str:
+    # Deprecated: keep for backward-compat if referenced, but new generation uses build_product_body_prompt().
+    final_title = clamp_spaces(final_title)
+    return build_product_body_prompt(final_title, 260, 320)
+
+
+MEMBERSHIP_FOOTER_HTML = (
+    "<p>"
+    "Quick note: you can visit our blog and search the same assets and download them for free, "
+    "but you will need to view some ads. If you do not want ads and you do not want to buy "
+    "individually, check out the "
+    '<a href="https://gplmama.com/membership/" rel="nofollow">GPLMama membership</a>. '
+    "After membership, you get single click downloads for 2200+ assets. "
+    "I charge a small amount to help maintain this platform."
+    "</p>"
+)
+
+
+def strip_membership_mentions(html: str) -> str:
+    if not html:
+        return ""
+    # Remove any paragraphs that contain the membership URL to avoid duplicates/placeholders.
+    html = re.sub(
+        r"<p[^>]*>[^<]*https?://gplmama\.com/membership/[^<]*</p>",
+        "",
+        html,
+        flags=re.IGNORECASE,
+    )
+    html = re.sub(r"\s+", " ", html).strip()
+    return html
+
+
+def ensure_description_heading(html: str, title: str) -> str:
+    title = clamp_spaces(title)
+    if not html:
+        return f"<h2>Why you need {title}?</h2>"
+    trimmed = html.lstrip()
+    if re.match(r"^\s*<h2\b", trimmed, flags=re.IGNORECASE):
+        return html
+    return f"<h2>Why you need {title}?</h2>\n{html}"
+
+
+def finalize_product_description(body_html: str, title: str) -> str:
+    body_html = strip_membership_mentions(body_html or "").strip()
+    body_html = ensure_description_heading(body_html, title)
+    # Always append our footer as the last paragraph, with a real hyperlink.
+    if 'href="https://gplmama.com/membership/' not in body_html:
+        return f"{body_html}\n{MEMBERSHIP_FOOTER_HTML}"
+    return body_html
+
+
+def build_product_body_prompt(title: str, min_words: int, max_words: int) -> str:
+    title = clamp_spaces(title)
+    min_words = max(120, int(min_words))
+    max_words = max(min_words + 20, int(max_words))
+    return f"""
+Write the MAIN WooCommerce product description body in HTML (do not include any membership/pricing/ads lines).
+
+Title: {title}
+
+Rules:
+- Output MUST be JSON: {{ "body_html": "..." }}
+- Word count for the body_html ONLY: {min_words} to {max_words} words (strict).
+- First line must be: <h2>Why you need {title}?</h2>
+- Then write short paragraphs and 1 <ul> list with 4 to 6 <li> items (practical use cases).
+- Mention it's great for testing/staging, and can be used for client sites at own risk.
+- Natural, professional tone like a cool 21-year-old web developer (not salesy).
+- Use simple words. No hype, no buzzwords, no AI-cliches.
+- Use active voice as much as possible. Avoid passive voice.
+- Keep sentences short: aim for 12 to 18 words, avoid sentences over 20 words.
+- Avoid complex words. Use plain words developers use.
+- Allowed HTML tags only: <h2>, <p>, <ul>, <li>, <strong>.
+- Do NOT include any URLs.
+- If you mention WooCommerce, spell it exactly "WooCommerce" (not "woocomerce").
+""".strip()
+
+
+def build_product_seo_prompt(product_title: str, description_html: str) -> str:
+    product_title = clamp_spaces(product_title)
+    summary = strip_html(description_html or "")
+    summary = re.sub(r"\s+", " ", summary).strip()[:800]
+    return f"""
+Generate SEO meta title, meta description, and a focus keyword for this WooCommerce product.
+
+Product title: {product_title}
+Description summary: {summary}
+
+Rules:
+- Output MUST be JSON: {{ "meta_title": "...", "meta_description": "...", "focus_keyword": "..." }}
+- meta_title: 50 to 60 characters (strict), no "official", no "free".
+- meta_description: 140 to 160 characters (strict), no "official", no "free".
+- focus_keyword: 2 to 4 words, lowercase, no brand names, no "free", no "official".
+- Do not use "woocommerce pro" anywhere (WooCommerce has no Pro product).
+- Do not misspell WooCommerce (never "woocomerce").
+- Use simple words WordPress devs search on Google.
+""".strip()
+
+
+def generate_product_description_html(
+    gemini: MultiKeyGemini, conn: sqlite3.Connection, title: str
+) -> Tuple[str, str, str]:
+    # We always append our own membership footer, so the model only writes the body.
+    footer_wc = html_word_count(MEMBERSHIP_FOOTER_HTML)
+    min_body = max(180, 300 - footer_wc)
+    max_body = max(min_body + 40, 400 - footer_wc)
+
+    prompt = build_product_body_prompt(title, min_body, max_body)
+    resp = gemini.generate(prompt, conn)
+    try:
+        data = extract_json(resp)
+    except Exception:
+        repair = build_json_repair_prompt(prompt, resp)
+        prompt = repair
+        resp = gemini.generate(prompt, conn)
+        data = extract_json(resp)
+
+    body_html = (data.get("body_html", "") or "").strip()
+    description_html = finalize_product_description(body_html, title)
+
+    wc = html_word_count(description_html)
+    for _ in range(2):
+        if 300 <= wc <= 400 and 'href="https://gplmama.com/membership/' in description_html:
+            break
+        adjust_prompt = f"""
+Your body_html must be adjusted so that after appending a fixed footer, the FINAL description is 300 to 400 words.
+
+Title: {title}
+Current final word count: {wc}
+
+Return ONLY valid JSON: {{ "body_html": "..." }}
+Rules:
+- body_html ONLY, no URLs, no membership text.
+- First line must be: <h2>Why you need {title}?</h2>
+- Use active voice. Keep sentences under 20 words.
+- Keep allowed tags: <h2>, <p>, <ul>, <li>, <strong>.
+""".strip()
+        prompt = adjust_prompt
+        resp = gemini.generate(prompt, conn)
+        try:
+            data = extract_json(resp)
+        except Exception:
+            repair = build_json_repair_prompt(prompt, resp)
+            prompt = repair
+            resp = gemini.generate(prompt, conn)
+            data = extract_json(resp)
+        body_html = (data.get("body_html", "") or "").strip()
+        description_html = finalize_product_description(body_html, title)
+        wc = html_word_count(description_html)
+
+    if not description_html:
+        raise ValueError("Gemini returned empty product description.")
+    if 'href="https://gplmama.com/membership/' not in description_html:
+        raise ValueError("Final description is missing membership hyperlink.")
+    return description_html, prompt, resp
+
+
+def html_word_count(html: str) -> int:
+    txt = strip_html(html or "")
+    parts = [p for p in re.split(r"\s+", txt.strip()) if p]
+    return len(parts)
+
+
+def generate_product_title_and_description(
+    gemini: MultiKeyGemini, conn: sqlite3.Connection, original_title: str
+) -> Tuple[str, str, str, str, str, str, str, str, str, str, str]:
+    title_prompt = build_product_title_prompt(original_title)
+    title_resp = gemini.generate(title_prompt, conn)
+    try:
+        title_data = extract_json(title_resp)
+    except Exception:
+        repair = build_json_repair_prompt(title_prompt, title_resp)
+        title_prompt = repair
+        title_resp = gemini.generate(title_prompt, conn)
+        title_data = extract_json(title_resp)
+
+    new_title = clamp_spaces(str(title_data.get("title", "") or ""))
+    new_title = remove_free_words(new_title)
+    new_title = normalize_woocommerce_spelling(new_title, proper_case=True)
+
+    for _ in range(2):
+        if (
+            title_len_ok(new_title)
+            and "official" not in new_title.lower()
+            and "woocommerce pro" not in new_title.lower()
+            and "woocomerce" not in new_title.lower()
+        ):
+            break
+        revise_prompt = f"""
+You must revise the product title to match the rules.
+
+Current title: {new_title}
+Character length: {len(new_title)}
+
+Rules:
+- Output MUST be JSON: {{ "title": "..." }}
+- 50 to 60 characters (strict).
+- Do not use the word "official".
+- Do not use the word "free" (any casing).
+- Do not use "WooCommerce Pro" (WooCommerce does not have a Pro product).
+- If you mention WooCommerce, spell it exactly "WooCommerce" (not "woocomerce").
+- Keep it simple and SEO-friendly for WordPress dev searches.
+""".strip()
+        title_prompt = revise_prompt
+        title_resp = gemini.generate(title_prompt, conn)
+        try:
+            title_data = extract_json(title_resp)
+        except Exception:
+            repair = build_json_repair_prompt(title_prompt, title_resp)
+            title_prompt = repair
+            title_resp = gemini.generate(title_prompt, conn)
+            title_data = extract_json(title_resp)
+        new_title = remove_free_words(clamp_spaces(str(title_data.get("title", "") or "")))
+        new_title = normalize_woocommerce_spelling(new_title, proper_case=True)
+
+    description_html, desc_prompt, desc_resp = generate_product_description_html(
+        gemini, conn, new_title
+    )
+    description_html = normalize_woocommerce_spelling(description_html, proper_case=True)
+
+    if not new_title:
+        raise ValueError("Gemini returned empty product title.")
+    if not description_html:
+        raise ValueError("Gemini returned empty product description.")
+    meta_title, meta_description, focus_keyword, seo_prompt, seo_resp = generate_product_seo_meta(
+        gemini, conn, new_title, description_html
+    )
+    return (
+        new_title,
+        description_html,
+        title_prompt,
+        title_resp,
+        desc_prompt,
+        desc_resp,
+        meta_title,
+        meta_description,
+        focus_keyword,
+        seo_prompt,
+        seo_resp,
+    )
+
+
+def generate_product_seo_meta(
+    gemini: MultiKeyGemini,
+    conn: sqlite3.Connection,
+    product_title: str,
+    description_html: str,
+) -> Tuple[str, str, str, str, str]:
+    def sanitize(text: str, *, proper_case: bool) -> str:
+        text = clamp_spaces(text or "")
+        text = remove_free_words(text)
+        text = re.sub(r"\bofficial\b", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bwoocommerce\s+pro\b", "WooCommerce", text, flags=re.IGNORECASE)
+        text = normalize_woocommerce_spelling(text, proper_case=proper_case)
+        return clamp_spaces(text)
+
+    def clamp_to_range(text: str, lo: int, hi: int, pad: str) -> str:
+        text = clamp_spaces(text)
+        if len(text) > hi:
+            cut = text[: hi + 1]
+            if " " in cut:
+                cut = cut.rsplit(" ", 1)[0]
+            text = cut.rstrip(" ,.-")
+        if len(text) < lo:
+            # Add a short pad phrase, then trim if it overshoots.
+            text = clamp_spaces(f"{text} {pad}".strip())
+            if len(text) > hi:
+                text = text[:hi].rstrip(" ,.-")
+        return clamp_spaces(text)
+
+    def derive_focus_keyword(title: str) -> str:
+        raw = slugify(title)
+        stop = {"premium", "download", "pro", "the", "and", "for", "with", "wordpress", "woocommerce"}
+        parts = [p for p in raw.split("-") if p and p not in stop]
+        if not parts:
+            parts = [p for p in raw.split("-") if p]
+        parts = parts[:4]
+        kw = " ".join(parts).lower()
+        kw = sanitize(kw, proper_case=False).lower()
+        # Ensure 2-4 words.
+        words = [w for w in kw.split() if w]
+        if len(words) < 2:
+            words = (words + ["download"])[:2]
+        if len(words) > 4:
+            words = words[:4]
+        return " ".join(words).strip()
+
+    prompt = build_product_seo_prompt(product_title, description_html)
+    resp = ""
+    data: Dict[str, Any] = {}
+    try:
+        resp = gemini.generate(prompt, conn)
+        try:
+            data = extract_json(resp)
+        except Exception:
+            repair = build_json_repair_prompt(prompt, resp)
+            prompt = repair
+            resp = gemini.generate(prompt, conn)
+            data = extract_json(resp)
+    except Exception:
+        # If Gemini fails, we still derive usable meta locally.
+        data = {}
+
+    meta_title = sanitize(str(data.get("meta_title", "") or product_title), proper_case=True)
+    meta_description = sanitize(str(data.get("meta_description", "") or ""), proper_case=True)
+    if not meta_description:
+        meta_description = sanitize(strip_html(description_html)[:180], proper_case=True)
+
+    focus_keyword = sanitize(str(data.get("focus_keyword", "") or ""), proper_case=False).lower()
+    if not focus_keyword:
+        focus_keyword = derive_focus_keyword(product_title)
+
+    meta_title = clamp_to_range(meta_title, 50, 60, pad="Premium Download")
+    meta_description = clamp_to_range(
+        meta_description, 140, 160, pad="GPL download for WordPress developers."
+    )
+
+    focus_keyword = derive_focus_keyword(focus_keyword or product_title)
+    if "woocommerce pro" in focus_keyword or "woocomerce" in focus_keyword:
+        focus_keyword = derive_focus_keyword(product_title)
+
+    return meta_title, meta_description, focus_keyword, prompt, resp
+
+
+def bulk_rewrite_products(start_date: str, end_date: str) -> None:
+    runtime = get_runtime_config()
+    if not (
+        runtime["wp_base_url"]
+        and runtime["wp_username"]
+        and runtime["wp_app_password"]
+        and (runtime["gemini_api_key"] or runtime.get("gemini_api_keys"))
+    ):
+        return
+
+    set_product_bulk_flag("product_bulk_running", "1")
+    set_product_bulk_flag("product_bulk_stop", "0")
+    set_product_bulk_message("Starting...")
+    conn = get_db()
+    wc_client = WooCommerceClient(
+        runtime["wp_base_url"], runtime["wp_username"], runtime["wp_app_password"]
+    )
+    wp_client = WordPressClient(
+        runtime["wp_base_url"], runtime["wp_username"], runtime["wp_app_password"]
+    )
+    gemini = MultiKeyGemini(runtime)
+
+    try:
+        # Use Z (UTC) to avoid WP/WC parsing ambiguities.
+        after = f"{start_date}T00:00:00Z"
+        before = f"{end_date}T23:59:59Z"
+
+        per_page = 100
+        max_pages = 200
+        first_batch, total_pages = wc_client.list_products(
+            page=1, per_page=per_page, after=after, before=before
+        )
+        total_pages = min(total_pages, max_pages)
+
+        # Phase 1: discover + queue (so UI shows progress immediately).
+        discovered = 0
+        queued = 0
+        skipped = 0
+        set_product_bulk_message(f"Fetching products 1/{total_pages}...")
+
+        def handle_discovered(product: Dict[str, Any]) -> None:
+            nonlocal discovered, queued, skipped
+            product_id = int(product.get("id") or 0)
+            if not product_id:
+                return
+            discovered += 1
+
+            existing = conn.execute(
+                "SELECT status FROM product_rewrite_status WHERE product_id = ?",
+                (product_id,),
+            ).fetchone()
+            if existing and existing["status"] in ("done", "partial", "skipped"):
+                return
+
+            old_title = clamp_spaces(product.get("name", "") or "")
+            permalink = str(product.get("permalink", "") or "")
+
+            if product_id == 3718:
+                with conn:
+                    update_product_status(
+                        conn,
+                        product_id,
+                        "skipped",
+                        "Skipped: excluded product_id 3718.",
+                        old_title=old_title,
+                        permalink=permalink,
+                    )
+                skipped += 1
+                return
+
+            if wc_is_membership_product(product):
+                with conn:
+                    update_product_status(
+                        conn,
+                        product_id,
+                        "skipped",
+                        "Skipped: membership category.",
+                        old_title=old_title,
+                        permalink=permalink,
+                    )
+                skipped += 1
+                return
+
+            with conn:
+                update_product_status(
+                    conn,
+                    product_id,
+                    "queued",
+                    None,
+                    old_title=old_title,
+                    permalink=permalink,
+                )
+            queued += 1
+
+        for product in first_batch:
+            if product_bulk_should_stop():
+                break
+            handle_discovered(product)
+
+        for page in range(2, total_pages + 1):
+            if product_bulk_should_stop():
+                break
+            set_product_bulk_message(f"Fetching products {page}/{total_pages}...")
+            batch, _tp = wc_client.list_products(
+                page=page, per_page=per_page, after=after, before=before
+            )
+            for product in batch:
+                if product_bulk_should_stop():
+                    break
+                handle_discovered(product)
+            if len(batch) < per_page:
+                break
+
+        if product_bulk_should_stop():
+            set_product_bulk_message(
+                f"Stopped during fetch. Discovered {discovered}, queued {queued}, skipped {skipped}."
+            )
+            return
+
+        set_product_bulk_message(
+            f"Fetched {discovered} products. Queued {queued}, skipped {skipped}. Rewriting..."
+        )
+
+        # Phase 2: process queued/error/processing rows in DB order.
+        while True:
+            if product_bulk_should_stop():
+                break
+
+            row = conn.execute(
+                """
+                SELECT product_id, old_title, permalink
+                FROM product_rewrite_status
+                WHERE status IN ('queued', 'error', 'processing')
+                ORDER BY updated_at ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                break
+
+            product_id = int(row["product_id"])
+            old_title = row["old_title"] or ""
+            permalink = row["permalink"] or ""
+            try:
+                with conn:
+                    update_product_status(
+                        conn,
+                        product_id,
+                        "processing",
+                        None,
+                        old_title=old_title,
+                        permalink=permalink,
+                    )
+
+                set_product_bulk_message(f"Rewriting product {product_id}...")
+                (
+                    new_title,
+                    description_html,
+                    title_prompt,
+                    title_resp,
+                    desc_prompt,
+                    desc_resp,
+                    seo_title,
+                    seo_description,
+                    focus_keyword,
+                    _seo_prompt,
+                    _seo_resp,
+                ) = (
+                    generate_product_title_and_description(gemini, conn, old_title)
+                )
+
+                meta: Dict[str, str] = {}
+                if runtime.get("product_meta_title_key"):
+                    meta[str(runtime["product_meta_title_key"])] = seo_title
+                if runtime.get("product_meta_description_key"):
+                    meta[str(runtime["product_meta_description_key"])] = seo_description
+                if runtime.get("product_focus_keyword_key"):
+                    meta[str(runtime["product_focus_keyword_key"])] = focus_keyword
+                if not meta:
+                    raise ValueError(
+                        "Missing product SEO meta keys. Set them in Settings (Yoast defaults use _yoast_wpseo_*)."
+                    )
+
+                new_slug = generate_product_slug(new_title)
+                if not new_slug:
+                    raise ValueError("Could not generate product slug.")
+
+                updated = wc_client.update_product(
+                    product_id,
+                    name=new_title,
+                    description_html=description_html,
+                    slug=new_slug,
+                    meta=meta or None,
+                )
+                ok_meta, meta_err = ensure_wc_product_meta(
+                    wc_client, wp_client, product_id, meta
+                )
+                new_permalink = str(updated.get("permalink", "") or permalink)
+                with conn:
+                    log_product_rewrite(
+                        conn,
+                        product_id,
+                        title_prompt,
+                        title_resp,
+                        desc_prompt,
+                        desc_resp,
+                    )
+                    update_product_status(
+                        conn,
+                        product_id,
+                        "done",
+                        None,
+                        old_title=old_title,
+                        new_title=new_title,
+                        permalink=new_permalink,
+                    )
+                    update_product_piece_flags(
+                        conn,
+                        product_id,
+                        title_done=1,
+                        desc_done=1,
+                        last_title_error="",
+                        last_desc_error="",
+                        seo_done=1 if ok_meta else 0,
+                        last_seo_error="" if ok_meta else meta_err,
+                        seo_title=seo_title,
+                        seo_description=seo_description,
+                        seo_focus_keyword=focus_keyword,
+                        slug_done=1,
+                        last_slug_error="",
+                        new_slug=new_slug,
+                    )
+                    if not ok_meta:
+                        update_product_status(
+                            conn,
+                            product_id,
+                            "partial",
+                            meta_err,
+                            old_title=old_title,
+                            new_title=new_title,
+                            permalink=new_permalink,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                with conn:
+                    update_product_status(
+                        conn,
+                        product_id,
+                        "error",
+                        str(exc),
+                        old_title=old_title,
+                        permalink=permalink,
+                    )
+                time.sleep(0.5)
+                continue
+            time.sleep(0.25)
+    finally:
+        conn.close()
+        set_product_bulk_message("Idle.")
+        set_product_bulk_flag("product_bulk_running", "0")
+
+
+def _product_filter_where(status_filter: str) -> Tuple[str, Tuple[Any, ...]]:
+    status_filter = (status_filter or "all").strip().lower()
+    if status_filter == "all":
+        return "", ()
+    if status_filter == "skipped":
+        return "WHERE status = 'skipped'", ()
+    if status_filter == "processing":
+        return "WHERE status = 'processing'", ()
+    if status_filter == "queued":
+        return "WHERE status = 'queued'", ()
+    if status_filter == "error":
+        return "WHERE status = 'error'", ()
+    if status_filter == "done":
+        return (
+            "WHERE status = 'done' OR (status != 'skipped' AND title_done = 1 AND desc_done = 1 AND seo_done = 1 AND slug_done = 1)",
+            (),
+        )
+    if status_filter == "partial":
+        return (
+            "WHERE status = 'partial' OR (status != 'skipped' AND status != 'done' "
+            "AND NOT (title_done = 1 AND desc_done = 1 AND seo_done = 1 AND slug_done = 1) "
+            "AND (title_done = 1 OR desc_done = 1 OR seo_done = 1 OR slug_done = 1))",
+            (),
+        )
+    if status_filter == "pending":
+        return (
+            "WHERE (status IS NULL OR status = '' OR status = 'pending') AND title_done = 0 AND desc_done = 0 AND seo_done = 0 AND slug_done = 0",
+            (),
+        )
+    # Unknown filter, show all.
+    return "", ()
+
+
+def build_products_context(
+    status_filter: str = "all", page: int = 1, per_page: int = 200
+) -> Dict[str, Any]:
+    page = max(1, int(page or 1))
+    per_page = max(10, min(int(per_page or 200), 1000))
+    offset = (page - 1) * per_page
+
+    conn = get_db()
+    where_sql, where_params = _product_filter_where(status_filter)
+
+    count_row = conn.execute(
+        f"SELECT COUNT(*) AS c FROM product_rewrite_status {where_sql}",
+        where_params,
+    ).fetchone()
+    filtered_total = int(count_row["c"] or 0) if count_row else 0
+    total_pages = max(1, (filtered_total + per_page - 1) // per_page)
+    if page > total_pages:
+        page = total_pages
+        offset = (page - 1) * per_page
+
+    rows = conn.execute(
+        f"""
+        SELECT product_id, status, updated_at, last_error, old_title, new_title, permalink,
+               title_done, desc_done, seo_done, slug_done,
+               last_title_error, last_desc_error, last_seo_error, last_slug_error,
+               seo_title, seo_description, seo_focus_keyword,
+               old_slug, new_slug
+        FROM product_rewrite_status
+        {where_sql}
+        ORDER BY updated_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        where_params + (per_page, offset),
+    ).fetchall()
+
+    counts_row = conn.execute(
+        """
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
+          SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) AS processing,
+          SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS queued,
+          SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error,
+          SUM(CASE WHEN status = 'done' OR (status != 'skipped' AND title_done = 1 AND desc_done = 1 AND seo_done = 1 AND slug_done = 1) THEN 1 ELSE 0 END) AS done,
+          SUM(CASE WHEN status != 'skipped'
+                    AND status != 'done'
+                    AND (status = 'partial' OR (
+                        NOT (title_done = 1 AND desc_done = 1 AND seo_done = 1 AND slug_done = 1)
+                        AND (title_done = 1 OR desc_done = 1 OR seo_done = 1 OR slug_done = 1)
+                    ))
+               THEN 1 ELSE 0 END) AS partial,
+          SUM(CASE WHEN (status IS NULL OR status = '' OR status = 'pending')
+                    AND title_done = 0 AND desc_done = 0 AND seo_done = 0 AND slug_done = 0
+               THEN 1 ELSE 0 END) AS pending
+        FROM product_rewrite_status
+        """
+    ).fetchone()
+
+    items = []
+    for row in rows:
+        status = compute_product_overall_status(row)
+        items.append(
+            {
+                "id": row["product_id"],
+                "status": status,
+                "updated_at": row["updated_at"],
+                "last_error": row["last_error"],
+                "old_title": row["old_title"],
+                "new_title": row["new_title"],
+                "permalink": row["permalink"],
+                "title_done": int(row["title_done"] or 0),
+                "desc_done": int(row["desc_done"] or 0),
+                "seo_done": int(row["seo_done"] or 0),
+                "slug_done": int(row["slug_done"] or 0),
+                "last_title_error": row["last_title_error"],
+                "last_desc_error": row["last_desc_error"],
+                "last_seo_error": row["last_seo_error"],
+                "last_slug_error": row["last_slug_error"],
+                "seo_title": row["seo_title"],
+                "seo_description": row["seo_description"],
+                "seo_focus_keyword": row["seo_focus_keyword"],
+                "old_slug": row["old_slug"],
+                "new_slug": row["new_slug"],
+            }
+        )
+
+    config = get_config(conn)
+    running_row = conn.execute(
+        "SELECT value FROM app_config WHERE key = ?",
+        ("product_bulk_running",),
+    ).fetchone()
+    msg_row = conn.execute(
+        "SELECT value FROM app_config WHERE key = ?",
+        ("product_bulk_message",),
+    ).fetchone()
+    msg_at_row = conn.execute(
+        "SELECT value FROM app_config WHERE key = ?",
+        ("product_bulk_message_at",),
+    ).fetchone()
+    conn.close()
+
+    running = bool(running_row and (running_row["value"] or "").strip() in ("1", "true", "yes"))
+    counts = {
+        "total": int(counts_row["total"] or 0) if counts_row else 0,
+        "pending": int(counts_row["pending"] or 0) if counts_row else 0,
+        "queued": int(counts_row["queued"] or 0) if counts_row else 0,
+        "processing": int(counts_row["processing"] or 0) if counts_row else 0,
+        "partial": int(counts_row["partial"] or 0) if counts_row else 0,
+        "done": int(counts_row["done"] or 0) if counts_row else 0,
+        "skipped": int(counts_row["skipped"] or 0) if counts_row else 0,
+        "error": int(counts_row["error"] or 0) if counts_row else 0,
+    }
+
+    return {
+        "items": items,
+        "counts": counts,
+        "running": running,
+        "message": (msg_row["value"] if msg_row else "") or "",
+        "message_at": (msg_at_row["value"] if msg_at_row else "") or "",
+        "default_start": "2026-02-04",
+        "default_end": "2026-02-08",
+        "status_filter": (status_filter or "all").strip().lower(),
+        "current_page": page,
+        "total_pages": total_pages,
+        "per_page": per_page,
+        "filtered_total": filtered_total,
+    }
+
+
+def process_single_product(product_id: int, mode: str) -> None:
+    mode = (mode or "both").strip().lower()
+    if mode not in ("title", "description", "both"):
+        mode = "both"
+
+    runtime = get_runtime_config()
+    if not (
+        runtime["wp_base_url"]
+        and runtime["wp_username"]
+        and runtime["wp_app_password"]
+        and (runtime["gemini_api_key"] or runtime.get("gemini_api_keys"))
+    ):
+        return
+
+    wc_client = WooCommerceClient(
+        runtime["wp_base_url"], runtime["wp_username"], runtime["wp_app_password"]
+    )
+    wp_client = WordPressClient(
+        runtime["wp_base_url"], runtime["wp_username"], runtime["wp_app_password"]
+    )
+    gemini = MultiKeyGemini(runtime)
+    conn = get_db()
+    try:
+        product = wc_client.get_product(product_id)
+        if product_id == 3718 or wc_is_membership_product(product):
+            reason = (
+                "Skipped: excluded product_id 3718."
+                if product_id == 3718
+                else "Skipped: membership category."
+            )
+            with conn:
+                update_product_status(
+                    conn,
+                    product_id,
+                    "skipped",
+                    reason,
+                    old_title=clamp_spaces(product.get("name", "") or ""),
+                    permalink=str(product.get("permalink", "") or ""),
+                )
+            return
+
+        old_title = clamp_spaces(product.get("name", "") or "")
+        permalink = str(product.get("permalink", "") or "")
+        current_desc = str(product.get("description", "") or "")
+        old_slug = clamp_spaces(product.get("slug", "") or "")
+
+        with conn:
+            update_product_status(
+                conn,
+                product_id,
+                "processing",
+                None,
+                old_title=old_title,
+                permalink=permalink,
+            )
+            update_product_piece_flags(conn, product_id, old_slug=old_slug)
+
+        if mode == "both":
+            set_product_bulk_message(f"Rewriting product {product_id} (title+desc)...")
+            (
+                new_title,
+                description_html,
+                title_prompt,
+                title_resp,
+                desc_prompt,
+                desc_resp,
+                seo_title,
+                seo_description,
+                focus_keyword,
+                _seo_prompt,
+                _seo_resp,
+            ) = generate_product_title_and_description(gemini, conn, old_title)
+
+            meta: Dict[str, str] = {}
+            if runtime.get("product_meta_title_key"):
+                meta[str(runtime["product_meta_title_key"])] = seo_title
+            if runtime.get("product_meta_description_key"):
+                meta[str(runtime["product_meta_description_key"])] = seo_description
+            if runtime.get("product_focus_keyword_key"):
+                meta[str(runtime["product_focus_keyword_key"])] = focus_keyword
+            if not meta:
+                raise ValueError(
+                    "Missing product SEO meta keys. Set them in Settings (Yoast defaults use _yoast_wpseo_*)."
+                )
+
+            new_slug = generate_product_slug(new_title)
+            if not new_slug:
+                raise ValueError("Could not generate product slug.")
+
+            updated = wc_client.update_product(
+                product_id,
+                name=new_title,
+                description_html=description_html,
+                slug=new_slug,
+                meta=meta or None,
+            )
+            ok_meta, meta_err = ensure_wc_product_meta(
+                wc_client, wp_client, product_id, meta
+            )
+            new_permalink = str(updated.get("permalink", "") or permalink)
+            with conn:
+                log_product_rewrite(
+                    conn,
+                    product_id,
+                    title_prompt,
+                    title_resp,
+                    desc_prompt,
+                    desc_resp,
+                )
+                update_product_status(
+                    conn,
+                    product_id,
+                    "done",
+                    None,
+                    old_title=old_title,
+                    new_title=new_title,
+                    permalink=new_permalink,
+                )
+                update_product_piece_flags(
+                    conn,
+                    product_id,
+                    title_done=1,
+                    desc_done=1,
+                    last_title_error="",
+                    last_desc_error="",
+                    seo_done=1 if ok_meta else 0,
+                    last_seo_error="" if ok_meta else meta_err,
+                    seo_title=seo_title,
+                    seo_description=seo_description,
+                    seo_focus_keyword=focus_keyword,
+                    slug_done=1,
+                    last_slug_error="",
+                    old_slug=old_slug,
+                    new_slug=new_slug,
+                )
+                if not ok_meta:
+                    update_product_status(
+                        conn,
+                        product_id,
+                        "partial",
+                        meta_err,
+                        old_title=old_title,
+                        new_title=new_title,
+                        permalink=new_permalink,
+                    )
+            return
+
+        if mode == "title":
+            set_product_bulk_message(f"Rewriting product {product_id} (title)...")
+            title_prompt = build_product_title_prompt(old_title)
+            title_resp = gemini.generate(title_prompt, conn)
+            try:
+                title_data = extract_json(title_resp)
+            except Exception:
+                repair = build_json_repair_prompt(title_prompt, title_resp)
+                title_prompt = repair
+                title_resp = gemini.generate(title_prompt, conn)
+                title_data = extract_json(title_resp)
+            new_title = remove_free_words(clamp_spaces(str(title_data.get("title", "") or "")))
+            if not title_len_ok(new_title) or "official" in new_title.lower():
+                raise ValueError("Generated title did not match rules (50-60 chars, no official).")
+
+            seo_title, seo_description, focus_keyword, _seo_prompt, _seo_resp = generate_product_seo_meta(
+                gemini, conn, new_title, current_desc
+            )
+            meta: Dict[str, str] = {}
+            if runtime.get("product_meta_title_key"):
+                meta[str(runtime["product_meta_title_key"])] = seo_title
+            if runtime.get("product_meta_description_key"):
+                meta[str(runtime["product_meta_description_key"])] = seo_description
+            if runtime.get("product_focus_keyword_key"):
+                meta[str(runtime["product_focus_keyword_key"])] = focus_keyword
+            if not meta:
+                raise ValueError(
+                    "Missing product SEO meta keys. Set them in Settings (Yoast defaults use _yoast_wpseo_*)."
+                )
+
+            new_slug = generate_product_slug(new_title)
+            if not new_slug:
+                raise ValueError("Could not generate product slug.")
+
+            updated = wc_client.update_product(
+                product_id,
+                name=new_title,
+                description_html=current_desc,
+                slug=new_slug,
+                meta=meta or None,
+            )
+            ok_meta, meta_err = ensure_wc_product_meta(
+                wc_client, wp_client, product_id, meta
+            )
+            new_permalink = str(updated.get("permalink", "") or permalink)
+            with conn:
+                update_product_status(
+                    conn,
+                    product_id,
+                    "partial",
+                    None,
+                    old_title=old_title,
+                    new_title=new_title,
+                    permalink=new_permalink,
+                )
+                update_product_piece_flags(
+                    conn,
+                    product_id,
+                    title_done=1,
+                    last_title_error="",
+                    seo_done=1 if ok_meta else 0,
+                    last_seo_error="" if ok_meta else meta_err,
+                    seo_title=seo_title,
+                    seo_description=seo_description,
+                    seo_focus_keyword=focus_keyword,
+                    slug_done=1,
+                    last_slug_error="",
+                    old_slug=old_slug,
+                    new_slug=new_slug,
+                )
+                if not ok_meta:
+                    update_product_status(
+                        conn,
+                        product_id,
+                        "partial",
+                        meta_err,
+                        old_title=old_title,
+                        new_title=new_title,
+                        permalink=new_permalink,
+                    )
+            return
+
+        # description
+        set_product_bulk_message(f"Rewriting product {product_id} (description)...")
+        description_html, desc_prompt, desc_resp = generate_product_description_html(
+            gemini, conn, old_title
+        )
+        seo_title, seo_description, focus_keyword, _seo_prompt, _seo_resp = generate_product_seo_meta(
+            gemini, conn, old_title, description_html
+        )
+        meta: Dict[str, str] = {}
+        if runtime.get("product_meta_title_key"):
+            meta[str(runtime["product_meta_title_key"])] = seo_title
+        if runtime.get("product_meta_description_key"):
+            meta[str(runtime["product_meta_description_key"])] = seo_description
+        if runtime.get("product_focus_keyword_key"):
+            meta[str(runtime["product_focus_keyword_key"])] = focus_keyword
+        if not meta:
+            raise ValueError(
+                "Missing product SEO meta keys. Set them in Settings (Yoast defaults use _yoast_wpseo_*)."
+            )
+
+        new_slug = generate_product_slug(old_title)
+        if not new_slug:
+            raise ValueError("Could not generate product slug.")
+
+        updated = wc_client.update_product(
+            product_id,
+            name=old_title,
+            description_html=description_html,
+            slug=new_slug,
+            meta=meta or None,
+        )
+        ok_meta, meta_err = ensure_wc_product_meta(
+            wc_client, wp_client, product_id, meta
+        )
+        new_permalink = str(updated.get("permalink", "") or permalink)
+        with conn:
+            update_product_status(
+                conn,
+                product_id,
+                "partial",
+                None,
+                old_title=old_title,
+                new_title=str(updated.get("name", "") or old_title),
+                permalink=new_permalink,
+            )
+            update_product_piece_flags(
+                conn,
+                product_id,
+                desc_done=1,
+                last_desc_error="",
+                seo_done=1 if ok_meta else 0,
+                last_seo_error="" if ok_meta else meta_err,
+                seo_title=seo_title,
+                seo_description=seo_description,
+                seo_focus_keyword=focus_keyword,
+                slug_done=1,
+                last_slug_error="",
+                old_slug=old_slug,
+                new_slug=new_slug,
+            )
+            if not ok_meta:
+                update_product_status(
+                    conn,
+                    product_id,
+                    "partial",
+                    meta_err,
+                    old_title=old_title,
+                    new_title=str(updated.get("name", "") or old_title),
+                    permalink=new_permalink,
+                )
+    except Exception as exc:  # noqa: BLE001
+        with conn:
+            update_product_status(conn, product_id, "error", str(exc))
+            if mode in ("title", "both"):
+                update_product_piece_flags(conn, product_id, last_title_error=str(exc))
+            if mode in ("description", "both"):
+                update_product_piece_flags(conn, product_id, last_desc_error=str(exc))
+            update_product_piece_flags(conn, product_id, last_seo_error=str(exc))
+    finally:
+        conn.close()
+
+
 @app.route("/")
 def index() -> str:
     status_filter = request.args.get("status", "all")
@@ -1166,6 +2923,11 @@ def settings() -> str:
         gemini_model = request.form.get("gemini_model", "").strip()
         meta_title_key = request.form.get("meta_title_key", "").strip()
         meta_description_key = request.form.get("meta_description_key", "").strip()
+        product_meta_title_key = request.form.get("product_meta_title_key", "").strip()
+        product_meta_description_key = request.form.get(
+            "product_meta_description_key", ""
+        ).strip()
+        product_focus_keyword_key = request.form.get("product_focus_keyword_key", "").strip()
         use_excerpt = "true" if request.form.get("use_excerpt") == "on" else "false"
         custom_prompt = request.form.get("custom_prompt", "").strip()
         inbound_links = request.form.get("inbound_links", "").strip()
@@ -1176,6 +2938,9 @@ def settings() -> str:
             "gemini_model": gemini_model or config.get("gemini_model", "gemini-1.5-flash"),
             "meta_title_key": meta_title_key,
             "meta_description_key": meta_description_key,
+            "product_meta_title_key": product_meta_title_key or config.get("product_meta_title_key", ""),
+            "product_meta_description_key": product_meta_description_key or config.get("product_meta_description_key", ""),
+            "product_focus_keyword_key": product_focus_keyword_key or config.get("product_focus_keyword_key", ""),
             "use_excerpt_for_meta_description": use_excerpt,
             "custom_prompt": custom_prompt or DEFAULT_CUSTOM_PROMPT,
             "inbound_links": inbound_links,
@@ -1203,6 +2968,126 @@ def settings() -> str:
         has_gemini_key=has_gemini_key,
         next_url=next_url,
     )
+
+
+@app.route("/products")
+def products() -> str:
+    runtime = get_runtime_config()
+    if not (
+        runtime["wp_base_url"]
+        and runtime["wp_username"]
+        and runtime["wp_app_password"]
+        and (runtime["gemini_api_key"] or runtime.get("gemini_api_keys"))
+    ):
+        flash("Missing configuration. Open Settings to finish setup.")
+    status_filter = request.args.get("status", "all")
+    try:
+        page = int(request.args.get("page", "1") or "1")
+    except ValueError:
+        page = 1
+    try:
+        per_page = int(request.args.get("per_page", "200") or "200")
+    except ValueError:
+        per_page = 200
+    context = build_products_context(status_filter=status_filter, page=page, per_page=per_page)
+    return render_template("products.html", **context)
+
+
+@app.route("/products/sync", methods=["POST"])
+def products_sync() -> str:
+    start_date = request.form.get("start_date", "").strip() or "2026-02-04"
+    end_date = request.form.get("end_date", "").strip() or "2026-02-08"
+    try:
+        datetime.fromisoformat(start_date)
+        datetime.fromisoformat(end_date)
+    except ValueError:
+        flash("Invalid date format. Use YYYY-MM-DD.")
+        return redirect_back("products")
+
+    EXECUTOR.submit(sync_products_to_db, start_date, end_date)
+    flash(f"Sync started for {start_date} to {end_date}.")
+    return redirect_back("products")
+
+
+@app.route("/products/do/<int:product_id>", methods=["POST"])
+def products_do(product_id: int) -> str:
+    mode = request.form.get("mode", "both").strip().lower()
+
+    conn = get_db()
+    row = conn.execute(
+        "SELECT status FROM product_rewrite_status WHERE product_id = ?",
+        (product_id,),
+    ).fetchone()
+    with conn:
+        if not row:
+            update_product_status(conn, product_id, "queued", None)
+        else:
+            if (row["status"] or "") != "skipped":
+                update_product_status(conn, product_id, "queued", None)
+    conn.close()
+
+    EXECUTOR.submit(process_single_product, product_id, mode)
+    flash(f"Queued product {product_id} for: {mode}.")
+    return redirect_back("products")
+
+
+@app.route("/products/bulk-do", methods=["POST"])
+def products_bulk_do() -> str:
+    mode = request.form.get("mode", "both").strip().lower()
+    ids = request.form.getlist("product_ids")
+    if not ids:
+        flash("No products selected.")
+        return redirect_back("products")
+
+    queued = 0
+    conn = get_db()
+    with conn:
+        for raw in ids:
+            try:
+                pid = int(raw)
+            except ValueError:
+                continue
+            row = conn.execute(
+                "SELECT status FROM product_rewrite_status WHERE product_id = ?",
+                (pid,),
+            ).fetchone()
+            if row and (row["status"] or "") == "skipped":
+                continue
+            update_product_status(conn, pid, "queued", None)
+            EXECUTOR.submit(process_single_product, pid, mode)
+            queued += 1
+    conn.close()
+
+    flash(f"Queued {queued} products for: {mode}.")
+    return redirect_back("products")
+
+
+@app.route("/products/start", methods=["POST"])
+def products_start() -> str:
+    start_date = request.form.get("start_date", "").strip() or "2026-02-04"
+    end_date = request.form.get("end_date", "").strip() or "2026-02-08"
+    try:
+        datetime.fromisoformat(start_date)
+        datetime.fromisoformat(end_date)
+    except ValueError:
+        flash("Invalid date format. Use YYYY-MM-DD.")
+        return redirect_back("products")
+
+    ctx = build_products_context()
+    if ctx.get("running"):
+        flash("A product rewrite job is already running. Click Stop or wait for it to finish.")
+        return redirect_back("products")
+
+    EXECUTOR.submit(bulk_rewrite_products, start_date, end_date)
+    flash(f"Started product rewrite job for {start_date} to {end_date}.")
+    return redirect_back("products")
+
+
+@app.route("/products/stop", methods=["POST"])
+def products_stop() -> str:
+    set_product_bulk_flag("product_bulk_stop", "1")
+    flash("Stop requested. The current product will finish, then the job will stop.")
+    return redirect_back("products")
 
 
 @app.route("/fetch-models", methods=["POST"])

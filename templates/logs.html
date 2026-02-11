@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% set title = "Logs" %}
+{% block content %}
+  <div class="card">
+    <h2>Generation Logs for Post {{ post_id }}</h2>
+    <a class="button secondary" href="{{ next_url }}">Back</a>
+  </div>
+
+  <div class="card">
+    {% if logs %}
+      <table>
+        <thead>
+          <tr>
+            <th>Created</th>
+            <th>Meta Title</th>
+            <th>Meta Description</th>
+            <th>Tags</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in logs %}
+            <tr>
+              <td class="small muted">{{ row["created_at"] }}</td>
+              <td>{{ row["meta_title"] or "-" }}</td>
+              <td>{{ row["meta_description"] or "-" }}</td>
+              <td class="small muted">{{ row["tags"] or "-" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">No logs yet.</p>
+    {% endif %}
+  </div>
+{% endblock %}

@@ -12,6 +12,7 @@ from app import (
     get_status_map,
     init_db,
     is_empty_content,
+    is_quota_error,
     normalize_title,
     perform_generation,
     update_status,
@@ -141,7 +142,8 @@ def main() -> int:
                     break
             except requests.RequestException as exc:
                 update_post_status(post_id, "error", str(exc))
-                print(f"  STATUS : RETRYING ({attempt})")
+                if not is_quota_error(exc):
+                    print(f"  STATUS : RETRYING ({attempt})")
                 time.sleep(wait)
                 wait = min(wait * 2, 300)
                 continue
@@ -158,7 +160,8 @@ def main() -> int:
                 break
             except Exception as exc:  # noqa: BLE001
                 update_post_status(post_id, "error", str(exc))
-                print(f"  STATUS : RETRYING ({attempt})")
+                if not is_quota_error(exc):
+                    print(f"  STATUS : RETRYING ({attempt})")
                 time.sleep(wait)
                 wait = min(wait * 2, 300)
 
